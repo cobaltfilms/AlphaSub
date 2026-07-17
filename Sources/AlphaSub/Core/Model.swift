@@ -1415,6 +1415,11 @@ public struct MediaReference: Codable {
     /// uses decodeIfPresent/encodeIfPresent for optionals) so older app
     /// versions can still open newer projects.
     public var shotChanges: [Double]?
+    /// Length in seconds of a detected counting leader (first frame → the
+    /// round-hour programme start), i.e. the end of the leader region in
+    /// media-time seconds from file start. `nil` when no leader was detected.
+    /// Optional so older projects decode unchanged and it's omitted when nil.
+    public var leaderSeconds: Double?
 
     public init(
         url: URL,
@@ -1425,7 +1430,8 @@ public struct MediaReference: Codable {
         container: VideoContainer? = nil,
         audioCodec: String? = nil,
         durationSeconds: Double? = nil,
-        shotChanges: [Double]? = nil
+        shotChanges: [Double]? = nil,
+        leaderSeconds: Double? = nil
     ) {
         self.url = url
         self.timecodeOffset = timecodeOffset
@@ -1436,6 +1442,7 @@ public struct MediaReference: Codable {
         self.audioCodec = audioCodec
         self.durationSeconds = durationSeconds
         self.shotChanges = shotChanges
+        self.leaderSeconds = leaderSeconds
     }
 
     public var fileExtension: String {
