@@ -512,10 +512,22 @@ extension Subtitle {
 public struct TextBlock: Codable, Equatable {
     public var segments: [TextSegment]
 
-    public init(segments: [TextSegment]) { self.segments = segments }
+    /// The language of this display line, used by bilingual tracks (e.g. Belgian
+    /// FR-over-NL cinema subtitles) to tell the two stacked languages apart for
+    /// per-line spell-checking and language-tagged export. `nil` means the line
+    /// inherits the track's primary language — the case for every monolingual
+    /// cue. Optional + synthesized Codable keeps older projects (which have no
+    /// such key) fully decodable, and the key is omitted when `nil`.
+    public var language: LanguageCode?
 
-    public init(plainText: String) {
+    public init(segments: [TextSegment], language: LanguageCode? = nil) {
+        self.segments = segments
+        self.language = language
+    }
+
+    public init(plainText: String, language: LanguageCode? = nil) {
         self.segments = [TextSegment(text: plainText, style: [])]
+        self.language = language
     }
 
     public var characterCount: Int {
@@ -542,7 +554,34 @@ public struct TextBlock: Codable, Equatable {
                 }
             }
         }
-        return lines.map { TextBlock(segments: $0.isEmpty ? [TextSegment(text: "", style: [])] : $0) }
+        return lines.map { TextBlock(segments: $0.isEmpty ? [TextSegment(text: "", style: [])] : $0, language: language) }
+    }
+
+    /// Collapse a possibly multi-line string into a single line, trimming each
+    /// line and joining with a space. Enforces the bilingual "one line per
+    /// language" rule (e.g. "Non.\n- Je sais où il est." → "Non. - Je sais où
+    /// il est.").
+    public static func collapsedLine(from text: String) -> String {
+        text.components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
+    /// Flatten a run of blocks into ONE language-tagged line, preserving each
+    /// segment's inline styling and inserting a space between joined lines.
+    /// Returns `nil` when there is no non-empty text. Used to build bilingual
+    /// cues (exactly two lines, one per language).
+    public static func oneLine(from blocks: [TextBlock], language: LanguageCode?) -> TextBlock? {
+        var segs: [TextSegment] = []
+        for block in blocks.flatMap({ $0.splitOnNewlines() }) {
+            let trimmed = block.plainText.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty { continue }
+            if !segs.isEmpty { segs.append(TextSegment(text: " ", style: [])) }
+            segs.append(contentsOf: block.segments.filter { !$0.text.isEmpty })
+        }
+        guard !segs.isEmpty else { return nil }
+        return TextBlock(segments: segs, language: language)
     }
 }
 
@@ -805,6 +844,41 @@ public struct Track: Codable, Identifiable {
         }
         set { metadata["track_default_align"] = newValue.rawValue }
     }
+
+    /// When true, the track is protected against accidental edits: cue text,
+    /// timing, positioning, add/delete, and timeline drag/resize are all
+    /// refused while locked. Stored in metadata so existing documents remain
+    /// compatible and the flag round-trips losslessly through the project file.
+    public var isLocked: Bool {
+        get { metadata["track_locked"] == "true" }
+        set {
+            if newValue { metadata["track_locked"] = "true" }
+            else { metadata.removeValue(forKey: "track_locked") }
+        }
+    }
+
+    /// The second language of a bilingual track (e.g. Dutch under French for
+    /// Belgian cinema). When set, the track is bilingual: each cue stacks
+    /// primary-language line(s) on top of secondary-language line(s), sharing one
+    /// timing. `language` is the primary (top) language; this is the secondary
+    /// (bottom). `nil` for ordinary monolingual tracks. Stored in metadata so the
+    /// flag round-trips losslessly and old projects stay compatible.
+    public var secondaryLanguage: LanguageCode? {
+        get {
+            guard let raw = metadata["track_secondary_lang"], !raw.isEmpty else { return nil }
+            return LanguageCode(raw)
+        }
+        set {
+            if let v = newValue, !v.rawValue.isEmpty {
+                metadata["track_secondary_lang"] = v.rawValue
+            } else {
+                metadata.removeValue(forKey: "track_secondary_lang")
+            }
+        }
+    }
+
+    /// Whether this track carries two stacked languages per cue.
+    public var isBilingual: Bool { secondaryLanguage != nil }
 
     /// Resolve the effective position for a given subtitle, falling back to track defaults
     /// when `subtitle.useCustomPosition` is false.
