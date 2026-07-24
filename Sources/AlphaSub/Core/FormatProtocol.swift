@@ -334,6 +334,22 @@ public extension Track {
             return LanguageBaliseProvider.bcp47(raw) ?? raw
         }
     }
+
+    /// The DCP `<Language>` value, honoring bilingual tracks. A bilingual track
+    /// (two languages stacked in one subtitle asset, e.g. Belgian FR-over-NL)
+    /// can't be expressed by a single RFC 5646 tag, so with `bilingualUsesMul`
+    /// (the default) it emits `mul` — ISO 639-2 "Multiple languages", the only
+    /// RFC-5646-valid way to say a file carries more than one language (SMPTE
+    /// lowercase, InterOp uppercase). When `bilingualUsesMul` is false, or the
+    /// track is monolingual, the primary language is used via `languageBalise`.
+    /// The two actual languages are still carried downstream by the DCP package
+    /// name and the CPL's MainSubtitleLanguageList (set by the mastering tool).
+    func dcpLanguageBalise(for formatID: FormatID, bilingualUsesMul: Bool) -> String {
+        if isBilingual && bilingualUsesMul {
+            return formatID == .dcp_smpte ? "mul" : "MUL"
+        }
+        return languageBalise(for: formatID)
+    }
 }
 
 /// Pluggable indirection so the Core target stays free of an
