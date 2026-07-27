@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - Format Identifiers
 
-public struct FormatID: RawRepresentable, Hashable, Codable {
+public struct FormatID: RawRepresentable, Hashable, Codable, Sendable {
     public let rawValue: String
     public init(rawValue: String) { self.rawValue = rawValue }
 
@@ -30,6 +30,7 @@ public struct FormatID: RawRepresentable, Hashable, Codable {
     public static let mov = FormatID(rawValue: "mov")
     public static let mp4 = FormatID(rawValue: "mp4")
     public static let mxf = FormatID(rawValue: "mxf")
+    public static let mkv = FormatID(rawValue: "mkv")
 
     // Video codecs
     public static let proRes4444XQ  = FormatID(rawValue: "prores_4444_xq")

@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - Video Container Format
 
-public enum VideoContainer: String, Codable, CaseIterable {
+public enum VideoContainer: String, Codable, CaseIterable, Sendable {
     case mov  = "mov"
     case mp4  = "mp4"
     case mxf  = "mxf"
@@ -38,7 +38,7 @@ public enum VideoContainer: String, Codable, CaseIterable {
 
 // MARK: - Video Codec
 
-public enum VideoCodec: String, Codable, CaseIterable {
+public enum VideoCodec: String, Codable, CaseIterable, Sendable {
     // Apple ProRes family
     case proRes4444XQ  = "prores_4444_xq"
     case proRes4444    = "prores_4444"
