@@ -80,3 +80,10 @@ feature. Learn more at **[alpha-sub.com](https://alpha-sub.com)**.
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+## Third-party components
+
+The AlphaSub app bundles open-source tools (ffmpeg — LGPL, Grok — AGPL,
+asdcplib — BSD) as separate subprocess binaries. The complete source offer,
+exact versions, and the build scripts we use are documented in
+[THIRD-PARTY.md](THIRD-PARTY.md).
