@@ -1,6 +1,55 @@
 import Foundation
 import CoreVideo
 
+// MARK: - Multi-reel global↔local frame mapping (pure, testable)
+//
+// Maps a global frame index (across all reels concatenated) to the segment
+// that owns it and the local frame index within that segment. Kept pure so
+// the mapping logic is unit-testable without a real MXF.
+
+public struct ReelSegmentMap: Sendable {
+    /// A located frame: which segment it lives in and the local index within
+    /// that segment.
+    public struct Location: Sendable, Equatable {
+        public let segment: Int
+        public let local: Int
+        public init(segment: Int, local: Int) {
+            self.segment = segment
+            self.local = local
+        }
+    }
+
+    /// Cumulative start offset (global frame index) of each segment.
+    public let offsets: [Int]
+    /// Frame count of each segment.
+    public let counts: [Int]
+    /// Total frames across all segments.
+    public let total: Int
+
+    public init(counts: [Int]) {
+        self.counts = counts
+        var off: [Int] = []
+        var acc = 0
+        for c in counts {
+            off.append(acc)
+            acc += c
+        }
+        self.offsets = off
+        self.total = acc
+    }
+
+    /// Returns the segment + local frame for a global frame index, or nil if
+    /// the global index is out of range.
+    public func locate(_ globalIndex: Int) -> Location? {
+        guard globalIndex >= 0, globalIndex < total else { return nil }
+        for i in offsets.indices where globalIndex >= offsets[i]
+            && globalIndex < offsets[i] + counts[i] {
+            return Location(segment: i, local: globalIndex - offsets[i])
+        }
+        return nil
+    }
+}
+
 // MARK: - Decode-ahead DCP frame source (open-core)
 //
 // Bridges the single-threaded, single-FileHandle MXFPictureReader to the
@@ -32,11 +81,22 @@ public actor DCPFrameSource {
         public let height: Int
     }
 
+    /// One reel's picture track inside a multi-reel composition. The reader
+    /// owns its own FileHandle (one per MXF); segments are concatenated in
+    /// global-frame-index order to form the full composition timeline.
+    struct Segment {
+        let reader: MXFPictureReader
+        let localFrameCount: Int
+        /// First global frame index covered by this segment.
+        let globalOffset: Int
+    }
+
     public let frameCount: Int
     /// Reduced-resolution decode level actually used (0 = full res).
     public let reduceLevel: Int
 
-    private let reader: MXFPictureReader
+    private var segments: [Segment] = []
+    private var map: ReelSegmentMap = ReelSegmentMap(counts: [])
     private let decoder: GrokDecoder
     private let converter = XYZColorConverter()
     private let capacity: Int
@@ -46,23 +106,58 @@ public actor DCPFrameSource {
     private var inFlight: [Int: Task<DisplayFrame, Error>] = [:]
     private let gate: DecodeGate
 
+    /// Single-reel convenience (preserved for backward compatibility).
     public init(pictureURL: URL,
                 pictureKey: Data? = nil,
                 decoder: GrokDecoder = GrokDecoder(),
                 reduceLevel: Int? = nil,
                 cacheCapacity: Int = 64,
                 maxConcurrentDecodes: Int = DCPFrameSource.defaultConcurrency) throws {
-        self.reader = try MXFPictureReader(url: pictureURL, pictureKey: pictureKey)
-        self.frameCount = try reader.frameCount()
+        let reader = try MXFPictureReader(url: pictureURL, pictureKey: pictureKey)
+        try self.init(segments: [(reader, pictureKey)], decoder: decoder,
+                      reduceLevel: reduceLevel, cacheCapacity: cacheCapacity,
+                      maxConcurrentDecodes: maxConcurrentDecodes)
+    }
+
+    /// Multi-reel init: one (reader, key) pair per reel that has a picture
+    /// asset. Reels without a picture are skipped (a composition may carry a
+    /// sound-only reel). The reduce level is picked from the first segment's
+    /// first frame so all reels decode at the same preview resolution.
+    public init(segments: [(reader: MXFPictureReader, pictureKey: Data?)],
+                decoder: GrokDecoder = GrokDecoder(),
+                reduceLevel: Int? = nil,
+                cacheCapacity: Int = 64,
+                maxConcurrentDecodes: Int = DCPFrameSource.defaultConcurrency) throws {
+        guard !segments.isEmpty else {
+            throw MXFPictureReader.ReaderError.noPictureFrames
+        }
         self.decoder = decoder
         self.capacity = max(4, cacheCapacity)
         self.gate = DecodeGate(limit: max(1, maxConcurrentDecodes))
-        // Pick a preview reduce level from the first frame's geometry unless the
-        // caller pinned one (e.g. full res for a still export).
+
+        var built: [Segment] = []
+        var globalOffset = 0
+        for (reader, _) in segments {
+            let count = try reader.frameCount()
+            guard count > 0 else { continue }
+            built.append(Segment(reader: reader,
+                                 localFrameCount: count,
+                                 globalOffset: globalOffset))
+            globalOffset += count
+        }
+        guard !built.isEmpty else {
+            throw MXFPictureReader.ReaderError.noPictureFrames
+        }
+        self.segments = built
+        self.map = ReelSegmentMap(counts: built.map(\.localFrameCount))
+        self.frameCount = map.total
+
+        // Pick a preview reduce level from the first segment's first frame
+        // unless the caller pinned one (e.g. full res for a still export).
         if let reduceLevel {
             self.reduceLevel = max(0, reduceLevel)
-        } else if frameCount > 0,
-                  let cs = try? reader.codestream(at: 0),
+        } else if let first = built.first,
+                  let cs = try? first.reader.codestream(at: 0),
                   let info = try? J2KCodestreamInfo(codestream: cs) {
             self.reduceLevel = info.previewReduceLevel
         } else {
@@ -138,8 +233,21 @@ public actor DCPFrameSource {
         return task
     }
 
-    private func readCodestream(at index: Int) throws -> Data {
-        try reader.codestream(at: index)
+    /// Maps a global frame index to its segment and reads the codestream from
+    /// that segment's reader. The actor isolation serialises FileHandle
+    /// access per reader (each reader has its own handle).
+    private func readCodestream(at globalIndex: Int) throws -> Data {
+        guard let loc = map.locate(globalIndex) else {
+            throw MXFPictureReader.ReaderError.frameOutOfRange(globalIndex)
+        }
+        return try segments[loc.segment].reader.codestream(at: loc.local)
+    }
+
+    /// Locates the segment owning a global frame index. Linear scan is fine —
+    /// DCPs have at most a handful of reels.
+    private func segment(for globalIndex: Int) -> Segment? {
+        guard let loc = map.locate(globalIndex) else { return nil }
+        return segments[loc.segment]
     }
 
     private func store(index: Int, result: Result<DisplayFrame, Error>) {

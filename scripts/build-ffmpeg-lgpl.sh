@@ -48,6 +48,13 @@ CONFIG_COMMON=(
     --disable-programs --enable-ffmpeg --enable-ffprobe
     --enable-static --disable-shared
     --disable-everything
+    # --disable-everything does NOT stop external-library autodetection:
+    # the native-arch pass found Homebrew's libX11 and dylib-linked it,
+    # which dyld then refuses inside the signed app (Team ID mismatch —
+    # broke DCP audio extraction on 1.5.0). Kill every desktop/display
+    # dependency explicitly; devices are never used by AlphaSub.
+    --disable-xlib --disable-libxcb --disable-sdl2
+    --disable-indevs --disable-outdevs
     --enable-videotoolbox --enable-audiotoolbox
 
     # Encoders AlphaSub uses through ffmpeg.

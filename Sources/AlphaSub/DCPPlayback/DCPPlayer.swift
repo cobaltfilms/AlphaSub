@@ -33,9 +33,24 @@ public final class DCPPlayer: ObservableObject {
     private var loop: DCPDisplayLoop?
 
     public convenience init(pictureURL: URL, fps: Double, pictureKey: Data? = nil,
-                            cacheCapacity: Int = 64) throws {
+                             cacheCapacity: Int = 64) throws {
         let source = try DCPFrameSource(pictureURL: pictureURL, pictureKey: pictureKey,
-                                        cacheCapacity: cacheCapacity)
+                                         cacheCapacity: cacheCapacity)
+        self.init(source: source, fps: fps)
+    }
+
+    /// Multi-reel init: one (URL, key) pair per reel that has a picture asset.
+    /// The caller (which can see DCPComposition) builds this list; the player
+    /// stays free of the paywalled DCP types. `fps` is the composition edit
+    /// rate (all reels share it).
+    public convenience init(pictureURLs: [(url: URL, key: Data?)],
+                             fps: Double,
+                             cacheCapacity: Int = 64) throws {
+        let segments: [(MXFPictureReader, Data?)] = try pictureURLs.map { entry in
+            let reader = try MXFPictureReader(url: entry.url, pictureKey: entry.key)
+            return (reader, entry.key)
+        }
+        let source = try DCPFrameSource(segments: segments, cacheCapacity: cacheCapacity)
         self.init(source: source, fps: fps)
     }
 
