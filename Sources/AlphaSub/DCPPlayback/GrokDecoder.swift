@@ -38,9 +38,15 @@ public struct GrokDecoder: Sendable {
 
     /// Test/override hook: an explicit path to `grk_decompress`.
     public var binaryOverride: String?
+    /// Process QoS for the `grk_decompress` subprocess. Playback uses
+    /// `.utility` so decode never starves the UI thread; offline export
+    /// uses `.userInitiated` for maximum throughput.
+    public var qualityOfService: QualityOfService
 
-    public init(binaryOverride: String? = nil) {
+    public init(binaryOverride: String? = nil,
+                qualityOfService: QualityOfService = .utility) {
         self.binaryOverride = binaryOverride
+        self.qualityOfService = qualityOfService
     }
 
     /// Resolved path to `grk_decompress`: an explicit override, then a bundled
@@ -105,12 +111,7 @@ public struct GrokDecoder: Sendable {
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: grok)
-        // Deliberately BELOW the UI: at userInteractive/-Initiated the decoder
-        // competes with the main thread and starves the timecode/UI (measured
-        // 130–450 ms main-delivery stalls). We have ~250 fps of headroom, so
-        // decode gently at `utility` — the picture stays smooth and the UI keeps
-        // the main thread.
-        proc.qualityOfService = .utility
+        proc.qualityOfService = qualityOfService
         // rawl = little-endian planar; stdout requires NO -o. `-r` decodes at a
         // reduced resolution (each level halves the canvas) for fast preview.
         var args = ["-i", inURL.path, "--out-fmt", "rawl", "-H", "1"]
