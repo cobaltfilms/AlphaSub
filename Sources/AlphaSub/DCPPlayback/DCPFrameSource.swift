@@ -58,18 +58,20 @@ public struct ReelSegmentMap: Sendable {
 // thread here, and the cache holds display-ready CVPixelBuffers, so the player
 // only has to wrap + enqueue on the main actor.
 //
-// Throughput (see grok-dcp-playback memory): Grok decode must be single-thread
-// (-H 1) to avoid the 20.3.7 segfault, so parallelism comes from decoding
-// several FRAMES at once. Full-res 2K decode is ~80 ms/frame; a reduced-
-// resolution preview (-r 1 → 1024-wide) is ~10 ms and a quarter the pixels to
-// convert — the difference between "far from real time" and smooth.
+// Throughput (see grok-dcp-playback memory): Grok decode now runs
+// multithreaded (-H 4 ≈ 17 ms for a 2K frame at preview reduce; a crash-by-
+// signal retries once at -H 1, the historically safe mode), and parallelism
+// also comes from decoding several FRAMES at once. Full-res 2K decode is
+// ~25 ms/frame multithreaded; a reduced-resolution preview (-r 1 → 1024-wide)
+// is a quarter the pixels to convert — the difference between "far from real
+// time" and smooth.
 //
 // Concurrency model:
 //   • Codestream extraction (seek + read) touches the shared FileHandle, so it
 //     is actor-isolated here — cheap and serial.
 //   • Decode + convert (the expensive part) run off-actor in detached tasks,
-//     capped by a semaphore at ~perf-core count and marked userInitiated so
-//     the Grok subprocess runs on the performance cores.
+//     capped by a cancellation-aware semaphore at ~perf-core count and marked
+//     userInitiated so the Grok subprocess runs on the performance cores.
 
 public actor DCPFrameSource {
 
@@ -103,7 +105,9 @@ public actor DCPFrameSource {
 
     private var cache: [Int: DisplayFrame] = [:]
     private var lru: [Int] = []
-    private var inFlight: [Int: Task<DisplayFrame, Error>] = [:]
+    /// In-flight decodes keyed by frame index; the UUID guards `store` against
+    /// a stale completion clearing a newer replacement task after a seek.
+    private var inFlight: [Int: (id: UUID, task: Task<DisplayFrame, Error>)] = [:]
     private let gate: DecodeGate
 
     /// Single-reel convenience (preserved for backward compatibility).
@@ -131,9 +135,18 @@ public actor DCPFrameSource {
         guard !segments.isEmpty else {
             throw MXFPictureReader.ReaderError.noPictureFrames
         }
-        self.decoder = decoder
+        let concurrency = max(1, maxConcurrentDecodes)
+        // Thread budget: what hits the scheduler is decodes × threads-per-
+        // decode, not either alone. A decoder left on its own default gets
+        // rescaled so the product stays around the core count; an explicitly
+        // configured decoder (offline export, tests) is honoured as given.
+        var budgeted = decoder
+        if budgeted.threadCount == GrokDecoder.defaultThreadCount {
+            budgeted.threadCount = Self.playbackThreadCount(concurrency: concurrency)
+        }
+        self.decoder = budgeted
         self.capacity = max(4, cacheCapacity)
-        self.gate = DecodeGate(limit: max(1, maxConcurrentDecodes))
+        self.gate = DecodeGate(limit: concurrency)
 
         var built: [Segment] = []
         var globalOffset = 0
@@ -165,6 +178,15 @@ public actor DCPFrameSource {
         }
     }
 
+    /// Intra-frame decode threads for playback: the core budget split across
+    /// the concurrent decodes, capped at 4 (Grok's own returns flatten past
+    /// that). 10 cores ÷ 3 decodes → 3 threads each ≈ one core per thread,
+    /// which leaves the UI and the display loop room to run.
+    public static func playbackThreadCount(concurrency: Int) -> Int {
+        let cores = ProcessInfo.processInfo.activeProcessorCount
+        return max(1, min(4, cores / max(1, concurrency)))
+    }
+
     public static var defaultConcurrency: Int {
         // Keep decode gentle: ~250 fps of headroom means a handful of workers
         // sustains 24 fps with a buffer, while leaving CPU/cores for the main
@@ -192,8 +214,38 @@ public actor DCPFrameSource {
         }
     }
 
+    /// A position jump (scrub, cue seek, JKL shuttle): cancel in-flight
+    /// decodes outside the window around the target so the visible frame
+    /// isn't queued behind stale work from the old position. Cancelled tasks
+    /// unwind through `store` and simply never land in the cache; the cache
+    /// itself is kept (LRU-bounded) so seeking back remains instant.
+    ///
+    /// Cancel-only — prefer `reposition`, which also arms the new window in
+    /// the same actor hop.
+    public func seek(to index: Int, behind: Int = 6, ahead: Int = 6) {
+        let lo = index - max(0, behind), hi = index + max(0, ahead)
+        for (i, entry) in inFlight where i < lo || i > hi {
+            entry.task.cancel()
+            inFlight[i] = nil
+        }
+    }
+
+    /// Moves the decode window to `index`: optionally drops stale work, then
+    /// arms the new window — as ONE actor call. Two separate calls race (the
+    /// display loop dispatches unordered `Task`s), and a cancel landing after
+    /// an arm kills the frames it just queued; the cancelled range is also the
+    /// exact complement of the armed one, so nothing useful is ever dropped.
+    public func reposition(to index: Int, ahead: Int = 16, behind: Int = 2,
+                           cancelStale: Bool = false) {
+        if cancelStale { seek(to: index, behind: behind, ahead: ahead) }
+        prefetch(around: index, ahead: ahead, behind: behind)
+    }
+
+    /// Full reset — cancels everything and drops the cache (~2 MB per frame,
+    /// 64 frames). Teardown only: swapping the source, closing the DCP. A
+    /// position jump wants `reposition`, which keeps the cache warm.
     public func flush() {
-        for (_, task) in inFlight { task.cancel() }
+        for (_, entry) in inFlight { entry.task.cancel() }
         inFlight.removeAll()
         cache.removeAll()
         lru.removeAll()
@@ -202,16 +254,25 @@ public actor DCPFrameSource {
     // MARK: Internals
 
     private func decodeTask(for index: Int) -> Task<DisplayFrame, Error> {
-        if let existing = inFlight[index] { return existing }
+        if let existing = inFlight[index], !existing.task.isCancelled {
+            return existing.task
+        }
         let decoder = self.decoder            // Sendable struct
         let converter = self.converter        // Sendable struct
         let gate = self.gate                  // actor
         let reduce = self.reduceLevel
-        let task = Task<DisplayFrame, Error>.detached(priority: .utility) { [weak self] in
+        let id = UUID()
+        let task = Task<DisplayFrame, Error>.detached(priority: .userInitiated) { [weak self] in
             guard let self else { throw CancellationError() }
             let codestream = try await self.readCodestream(at: index)
             try Task.checkCancellation()
-            await gate.acquire()
+            // A task cancelled while waiting on the gate resumes WITHOUT a
+            // slot — bail before the matching release unbalances the count.
+            // Conversely, once a slot is held the release must be installed
+            // before anything that can throw: a cancellation landing between
+            // the grant and the `defer` would leak the slot permanently, and
+            // the gate only has 2–4 of them (picture freezes for good).
+            guard await gate.acquire() else { throw CancellationError() }
             defer { Task { await gate.release() } }
             try Task.checkCancellation()
             let decoded = try decoder.decodeToPlanar(codestream, reduce: reduce)
@@ -225,10 +286,10 @@ public actor DCPFrameSource {
             return DisplayFrame(pixelBuffer: pb,
                                 width: decoded.info.width, height: decoded.info.height)
         }
-        inFlight[index] = task
+        inFlight[index] = (id, task)
         Task { [weak self] in
             let result = await task.result
-            await self?.store(index: index, result: result)
+            await self?.store(index: index, id: id, result: result)
         }
         return task
     }
@@ -250,8 +311,10 @@ public actor DCPFrameSource {
         return segments[loc.segment]
     }
 
-    private func store(index: Int, result: Result<DisplayFrame, Error>) {
-        inFlight[index] = nil
+    private func store(index: Int, id: UUID, result: Result<DisplayFrame, Error>) {
+        // Only the task still tracked for this index may clear its slot — a
+        // cancelled task's late completion must not drop a replacement.
+        if inFlight[index]?.id == id { inFlight[index] = nil }
         guard case .success(let frame) = result else { return }
         cache[index] = frame
         touch(index)
@@ -272,23 +335,64 @@ public actor DCPFrameSource {
 }
 
 /// Simple async counting semaphore to cap concurrent decodes.
+/// Cancellation-aware: a task cancelled while waiting resumes immediately
+/// WITHOUT taking a slot (the waiter resumes with `granted == false`), so
+/// seek-cancellation frees the gate for the newly visible frame at once
+/// instead of leaking a suspended waiter until the next release.
 actor DecodeGate {
     private let limit: Int
     private var active = 0
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var waiters: [(id: UUID, c: CheckedContinuation<Bool, Never>)] = []
+    /// IDs cancelled before their continuation was registered (cancel/await
+    /// race) — checked when the waiter is appended.
+    private var cancelledIDs: Set<UUID> = []
 
     init(limit: Int) { self.limit = limit }
 
-    func acquire() async {
-        if active < limit { active += 1; return }
-        await withCheckedContinuation { waiters.append($0) }
-        active += 1
+    /// Slots currently held. Test hook — a healthy gate returns to 0 once
+    /// every decode has finished or been cancelled.
+    var activeSlots: Int { active }
+
+    /// Returns true when the caller HOLDS a slot and MUST call `release()`,
+    /// false when it was cancelled and holds nothing. The caller has to see
+    /// this: installing the matching `release` is only correct on the true
+    /// branch, and skipping it is only correct on the false branch.
+    func acquire() async -> Bool {
+        // An already-cancelled task must not take a slot: its next
+        // checkCancellation would throw and the slot would never come back.
+        if Task.isCancelled { return false }
+        if active < limit, waiters.isEmpty { active += 1; return true }
+        let id = UUID()
+        let granted = await withTaskCancellationHandler {
+            await withCheckedContinuation { (c: CheckedContinuation<Bool, Never>) in
+                if cancelledIDs.remove(id) != nil {
+                    c.resume(returning: false)
+                } else {
+                    waiters.append((id, c))
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelWaiter(id) }
+        }
+        if granted { active += 1 }
+        // A cancel that landed after the grant left an id behind — drop it.
+        if !cancelledIDs.isEmpty { cancelledIDs.remove(id) }
+        return granted
     }
 
     func release() {
         active -= 1
-        if !waiters.isEmpty {
-            waiters.removeFirst().resume()
+        guard !waiters.isEmpty else { return }
+        let w = waiters.removeFirst()
+        w.c.resume(returning: true)
+    }
+
+    private func cancelWaiter(_ id: UUID) {
+        if let i = waiters.firstIndex(where: { $0.id == id }) {
+            let w = waiters.remove(at: i)
+            w.c.resume(returning: false)
+        } else {
+            cancelledIDs.insert(id)
         }
     }
 }

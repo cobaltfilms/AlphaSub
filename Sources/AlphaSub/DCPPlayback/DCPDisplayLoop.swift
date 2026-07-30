@@ -32,6 +32,7 @@ final class DCPDisplayLoop: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.alphasub.dcp.display", qos: .userInitiated)
     private var timer: DispatchSourceTimer?
     private var lastFrame = -1
+    private var lastPrefetchFrame = -1
     private let formatCache = FrameFormatCache()
 
     init(source: DCPFrameSource,
@@ -92,9 +93,25 @@ final class DCPDisplayLoop: @unchecked Sendable {
 
         // Keep a modest buffer ahead of the playhead — enough to smooth a slow
         // decode, but not so deep that filling it bursts CPU and starves the UI.
-        let ahead = playing ? 16 : 6
-        let behind = playing ? 2 : 6
-        Task { await source.prefetch(around: frame, ahead: ahead, behind: behind) }
+        // Only re-arm when the playhead actually moved: scanning the window is
+        // actor traffic that competes with the visible-frame fetch at 60 Hz.
+        //
+        // A jump beyond the normal advance/prefetch window is a seek (scrub,
+        // cue jump, JKL shuttle): the source also drops decodes for the old
+        // position, otherwise the newly visible frame queues behind them and
+        // the picture "hangs" on the pre-seek frame. Cancel and arm go in ONE
+        // call — as two unordered Tasks the cancel can land after the arm and
+        // kill the window it just queued.
+        if frame != lastPrefetchFrame {
+            let jumped = lastFrame >= 0 && (frame < lastFrame - 4 || frame > lastFrame + 16)
+            lastPrefetchFrame = frame
+            let ahead = playing ? 16 : 6
+            let behind = playing ? 2 : 6
+            Task {
+                await source.reposition(to: frame, ahead: ahead, behind: behind,
+                                        cancelStale: jumped)
+            }
+        }
 
         guard force || frame != lastFrame else { return }
         lastFrame = frame
@@ -111,27 +128,31 @@ final class DCPDisplayLoop: @unchecked Sendable {
     }
 
     private func enqueue(_ pixelBuffer: CVPixelBuffer) {
+        if !layers.isEmpty, let format = formatCache.format(for: pixelBuffer) {
+            var timing = CMSampleTimingInfo(duration: .invalid,
+                                            presentationTimeStamp: .invalid,
+                                            decodeTimeStamp: .invalid)
+            var sample: CMSampleBuffer?
+            let status = CMSampleBufferCreateReadyWithImageBuffer(
+                allocator: kCFAllocatorDefault, imageBuffer: pixelBuffer,
+                formatDescription: format, sampleTiming: &timing, sampleBufferOut: &sample)
+            if status == noErr, let sample {
+                if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true),
+                   CFArrayGetCount(attachments) > 0 {
+                    let dict = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
+                    CFDictionarySetValue(dict,
+                        unsafeBitCast(kCMSampleAttachmentKey_DisplayImmediately, to: UnsafeRawPointer.self),
+                        unsafeBitCast(kCFBooleanTrue, to: UnsafeRawPointer.self))
+                }
+                for layer in layers {
+                    if layer.status == .failed { layer.flush() }
+                    layer.enqueue(sample)
+                }
+            }
+        }
+        // SDI hook runs AFTER the on-screen enqueue: a slow DeckLink feed must
+        // never delay the picture the operator is looking at.
         onFrame?(pixelBuffer)
-        guard !layers.isEmpty, let format = formatCache.format(for: pixelBuffer) else { return }
-        var timing = CMSampleTimingInfo(duration: .invalid,
-                                        presentationTimeStamp: .invalid,
-                                        decodeTimeStamp: .invalid)
-        var sample: CMSampleBuffer?
-        let status = CMSampleBufferCreateReadyWithImageBuffer(
-            allocator: kCFAllocatorDefault, imageBuffer: pixelBuffer,
-            formatDescription: format, sampleTiming: &timing, sampleBufferOut: &sample)
-        guard status == noErr, let sample else { return }
-        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true),
-           CFArrayGetCount(attachments) > 0 {
-            let dict = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
-            CFDictionarySetValue(dict,
-                unsafeBitCast(kCMSampleAttachmentKey_DisplayImmediately, to: UnsafeRawPointer.self),
-                unsafeBitCast(kCFBooleanTrue, to: UnsafeRawPointer.self))
-        }
-        for layer in layers {
-            if layer.status == .failed { layer.flush() }
-            layer.enqueue(sample)
-        }
     }
 }
 

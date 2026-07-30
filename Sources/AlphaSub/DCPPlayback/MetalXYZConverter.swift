@@ -23,9 +23,14 @@ final class MetalXYZConverter: @unchecked Sendable {
     private let queue: MTLCommandQueue
     private let pipeline: MTLComputePipelineState
     private let textureCache: CVMetalTextureCache
+    /// Guards ONLY the pixel-buffer pool and texture cache (not thread-safe).
+    /// Metal devices and command queues are thread-safe, so concurrent decode
+    /// tasks submit their own command buffers without convoying behind one
+    /// global lock.
     private let lock = NSLock()
     private var pool: CVPixelBufferPool?
     private var poolW = 0, poolH = 0
+    private var conversionsSinceFlush = 0
 
     private static let kernelSource = """
     #include <metal_stdlib>
@@ -74,35 +79,60 @@ final class MetalXYZConverter: @unchecked Sendable {
         guard info.componentCount == 3, info.precision <= 16 else { return nil }
         let w = info.width, h = info.height
 
-        lock.lock()
-        defer { lock.unlock() }
+        // Shared-state section: pool + texture cache only.
+        let prepared: (CVPixelBuffer, MTLTexture)? = {
+            lock.lock()
+            defer { lock.unlock() }
+            guard let pb = makePixelBuffer(width: w, height: h),
+                  let tex = makeTexture(from: pb, width: w, height: h) else { return nil }
+            conversionsSinceFlush += 1
+            if conversionsSinceFlush >= 64 {
+                CVMetalTextureCacheFlush(textureCache, 0)
+                conversionsSinceFlush = 0
+            }
+            return (pb, tex)
+        }()
+        guard let (pixelBuffer, outTexture) = prepared else { return nil }
 
-        guard let pixelBuffer = makePixelBuffer(width: w, height: h),
-              let outTexture = makeTexture(from: pixelBuffer, width: w, height: h) else { return nil }
+        // Upload the planar samples ZERO-COPY (shared storage on Apple GPUs).
+        // Safe with bytesNoCopy because waitUntilCompleted() below keeps the
+        // GPU read inside this withUnsafeBytes scope.
+        //
+        // bytesNoCopy REQUIRES a page-aligned pointer and a page-multiple
+        // length, and Data promises neither: a multi-MB frame happens to get
+        // page-aligned storage from malloc, but a small or oddly-sized one
+        // (unusual reduce level, non-2K geometry) does not. Copy in that case
+        // rather than hand Metal an invalid buffer — a few hundred µs beats a
+        // nil buffer that silently demotes the whole conversion to the CPU.
+        return frame.planarData.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress, raw.count > 0 else { return nil }
+            let page = Int(getpagesize())
+            let canAlias = Int(bitPattern: base) % page == 0 && raw.count % page == 0
+            let buffer = canAlias
+                ? device.makeBuffer(bytesNoCopy: UnsafeMutableRawPointer(mutating: base),
+                                    length: raw.count, options: .storageModeShared,
+                                    deallocator: nil)
+                : device.makeBuffer(bytes: base, length: raw.count, options: .storageModeShared)
+            guard let inBuffer = buffer,
+                  let cmd = queue.makeCommandBuffer(),
+                  let enc = cmd.makeComputeCommandEncoder() else { return nil }
 
-        // Upload the planar samples (shared storage — zero-copy on Apple GPUs).
-        let inBuffer: MTLBuffer? = frame.planarData.withUnsafeBytes { raw in
-            device.makeBuffer(bytes: raw.baseAddress!, length: raw.count, options: .storageModeShared)
+            var dims = SIMD2<UInt32>(UInt32(w), UInt32(h))
+            enc.setComputePipelineState(pipeline)
+            enc.setBuffer(inBuffer, offset: 0, index: 0)
+            enc.setBytes(&dims, length: MemoryLayout<SIMD2<UInt32>>.stride, index: 1)
+            enc.setTexture(outTexture, index: 0)
+            let tw = pipeline.threadExecutionWidth
+            let th = max(1, pipeline.maxTotalThreadsPerThreadgroup / tw)
+            let tgSize = MTLSize(width: tw, height: th, depth: 1)
+            let tgCount = MTLSize(width: (w + tw - 1) / tw, height: (h + th - 1) / th, depth: 1)
+            enc.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
+            enc.endEncoding()
+            cmd.commit()
+            cmd.waitUntilCompleted()
+            guard cmd.status == .completed else { return nil }
+            return pixelBuffer
         }
-        guard let inBuffer,
-              let cmd = queue.makeCommandBuffer(),
-              let enc = cmd.makeComputeCommandEncoder() else { return nil }
-
-        var dims = SIMD2<UInt32>(UInt32(w), UInt32(h))
-        enc.setComputePipelineState(pipeline)
-        enc.setBuffer(inBuffer, offset: 0, index: 0)
-        enc.setBytes(&dims, length: MemoryLayout<SIMD2<UInt32>>.stride, index: 1)
-        enc.setTexture(outTexture, index: 0)
-        let tw = pipeline.threadExecutionWidth
-        let th = max(1, pipeline.maxTotalThreadsPerThreadgroup / tw)
-        let tgSize = MTLSize(width: tw, height: th, depth: 1)
-        let tgCount = MTLSize(width: (w + tw - 1) / tw, height: (h + th - 1) / th, depth: 1)
-        enc.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
-        enc.endEncoding()
-        cmd.commit()
-        cmd.waitUntilCompleted()
-        guard cmd.status == .completed else { return nil }
-        return pixelBuffer
     }
 
     // MARK: Buffers
