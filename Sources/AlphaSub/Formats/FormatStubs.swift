@@ -22,6 +22,8 @@ public func registerAllFormats() {
     registry.registerImporter(XLSXImporter.self)
     registry.registerImporter(PremiereImporter.self)
     registry.registerImporter(FCPXMLImporter.self)
+    registry.registerImporter(DCPSMPTEImporter.self)
+    registry.registerImporter(DCPInterOpImporter.self)
 
     // Exporters
     registry.registerExporter(SRTExporter.self)
@@ -35,4 +37,6 @@ public func registerAllFormats() {
     registry.registerExporter(DOCXExporter.self)
     registry.registerExporter(PremiereExporter.self)
     registry.registerExporter(FCPXMLExporter.self)
+    registry.registerExporter(DCPSMPTEExporter.self)
+    registry.registerExporter(DCPInterOpExporter.self)
 }

@@ -59,12 +59,23 @@ CONFIG_COMMON=(
 
     # Encoders AlphaSub uses through ffmpeg.
     # prores_ks = the LGPL ProRes 4444 XQ encoder (AVFoundation rejects ap4x).
-    --enable-encoder=dnxhd,prores_ks,aac,pcm_s24le,pcm_s16le,mjpeg
+    # png + image2 = the still frames "Improve by Context" feeds to the
+    # vision model (MediaClipExtractor writes frame_%04d.png).
+    --enable-encoder=dnxhd,prores_ks,aac,pcm_s24le,pcm_s16le,mjpeg,png
+    --enable-muxer=image2,image2pipe
+    --enable-demuxer=image2,image2pipe
+    --enable-decoder=png
     --enable-encoder=h264_videotoolbox,hevc_videotoolbox
     --enable-encoder=srt,ass,movtext,subrip,webvtt
 
     # Muxers (export) + demuxers (import/remux/extraction).
-    --enable-muxer=matroska,mov,mp4,mxf,wav,ipod,null,s16le,s24le,hls
+    # NB: the raw-PCM muxers are called `pcm_s16le`/`pcm_s24le` at configure
+    # time even though ffmpeg lists (and `-f` takes) them as `s16le`/`s24le`.
+    # Spelling them the short way here got them silently dropped, and audio
+    # extraction died with "Requested output format 's16le' is not known".
+    # configure ignores unknown component names without a word of warning —
+    # the post-build check at the bottom of this script is the only guard.
+    --enable-muxer=matroska,mov,mp4,mxf,wav,ipod,null,pcm_s16le,pcm_s24le,hls
     # rawvideo demuxer = the export engine's stdin pipe input (-f rawvideo).
     --enable-demuxer=rawvideo,matroska,mov,mpegts,wav,aac,mp3,flac,ogg,ass,srt,webvtt,mxf,avi
 
@@ -77,7 +88,12 @@ CONFIG_COMMON=(
     --enable-parser=h264,hevc,mpegvideo,mpeg4video,aac,ac3,vp8,vp9,av1,mjpeg
     --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,extract_extradata,aac_adtstoasc
     --enable-protocol=file,pipe
+    # Filters. Missing ones are fatal at runtime ("No such filter: 'x'"),
+    # not silently skipped: 7.1 shipped without `highpass` and every
+    # transcription died in audio extraction. Keep this in sync with the
+    # filter names used in Swift (grep for '"-af"' / '"-vf"').
     --enable-filter=scale,format,aresample,anull,null,pan,aformat,volume,concat
+    --enable-filter=highpass,lowpass,fps,atrim,trim,amix,aselect,select,setpts,asetpts
     --enable-swscale --enable-swresample
 )
 
@@ -130,6 +146,44 @@ Configured with: --disable-gpl --disable-nonfree (no GPL or nonfree
 components are compiled in; see LICENSE.LGPL for terms).
 Built: $(date -u +%Y-%m-%dT%H:%M:%SZ) on $(sw_vers -productVersion)
 EOF
+
+# Sanity: every component AlphaSub actually invokes must be in the binary.
+# A missing one is not a graceful degradation — ffmpeg aborts the whole
+# command ("No such filter: 'highpass'", "Requested output format 's16le'
+# is not known"), which is how 1.5.5 shipped with transcription dead. These
+# are ffmpeg's *runtime* names (what `-f`/`-af` take), which differ from the
+# configure names above for the raw-PCM muxers.
+check_components() {  # $1 = listing flag (filters|encoders|muxers|…), $@ = names
+    local kind="$1"; shift
+    local listing missing=()
+    listing="$("$DEST/ffmpeg" -hide_banner "-$kind" 2>/dev/null)"
+    for name in "$@"; do
+        # Entries look like " TSC highpass  A->A  …" / " E s16le  PCM …",
+        # and some (de)muxers share one line under comma-joined aliases
+        # (" D  matroska,webm  Matroska / WebM"), so commas delimit too.
+        grep -qE "(^|[[:space:],])$name([[:space:],]|$)" <<< "$listing" || missing+=("$name")
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo "✗ built ffmpeg is missing $kind: ${missing[*]}" >&2
+        echo "  (check the --enable-$(sed 's/s$//' <<< "$kind")= names — configure" >&2
+        echo "   ignores unknown component names silently)" >&2
+        return 1
+    fi
+    echo "  ✓ $kind: $*"
+}
+echo "==> verifying components AlphaSub depends on…"
+FAILED=0
+check_components filters highpass pan fps scale format aresample concat || FAILED=1
+check_components encoders dnxhd prores_ks aac pcm_s16le pcm_s24le png mjpeg \
+    h264_videotoolbox hevc_videotoolbox || FAILED=1
+check_components muxers matroska mov mp4 mxf wav s16le s24le image2 null || FAILED=1
+check_components demuxers matroska mov mxf wav rawvideo image2 avi || FAILED=1
+check_components decoders h264 hevc prores dnxhd jpeg2000 aac ac3 eac3 mp3 png || FAILED=1
+if [ "$FAILED" -ne 0 ]; then
+    echo "✗ the ffmpeg just installed into Resources/ cannot run AlphaSub's" >&2
+    echo "  commands — fix the whitelist above and re-run before packaging." >&2
+    exit 1
+fi
 
 # Sanity: the banner must NOT report --enable-gpl.
 if "$DEST/ffmpeg" -version | head -3 | grep -q -- "--enable-gpl"; then
