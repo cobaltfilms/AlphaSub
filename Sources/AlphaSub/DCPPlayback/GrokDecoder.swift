@@ -57,12 +57,14 @@ public struct GrokDecoder: Sendable {
         self.threadCount = max(1, threadCount)
     }
 
-    /// Decode threads per frame. Playback runs 2-4 decodes concurrently, so
-    /// per-frame threading stays moderate; measured sweet spot on a 10-core
-    /// Apple Silicon is ~4 (-H 4 x3 concurrent ≈ 160 fps at preview reduce).
-    public static var defaultThreadCount: Int {
-        max(2, min(4, ProcessInfo.processInfo.activeProcessorCount / 2))
-    }
+    /// Decode threads per frame — ONE. Measured on two real DCI packages
+    /// (DecodeIntegrityTests, 2026-07-30): -H 4 is *slower* than -H 1 on a 2K
+    /// frame (110.6 ms vs 103.7 ms), because the cost is the process, not the
+    /// entropy decode. Multithreading therefore buys nothing measurable while
+    /// re-entering the code path that historically corrupted or crashed on
+    /// DCI Part-1 streams. Parallelism comes from decoding several FRAMES at
+    /// once instead. Callers can still opt in via `threadCount:`.
+    public static var defaultThreadCount: Int { 1 }
 
     /// Resolved path to `grk_decompress`: an explicit override, then a bundled
     /// copy in the app's Resources (`grok/grk_decompress`), then Homebrew /

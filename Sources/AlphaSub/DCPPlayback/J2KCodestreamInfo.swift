@@ -93,9 +93,18 @@ public struct J2KCodestreamInfo: Sendable, Equatable {
 
     /// A sensible reduce level for real-time preview: aim for ~1024px wide.
     /// 2K → 1 (1024), 4K → 2 (1024), already-small → 0.
+    /// Decode-time reduction for playback. MEASURED on real DCI streams
+    /// (DecodeIntegrityTests, 2026-07-30): a 2K frame costs 103.7 ms full-res
+    /// vs 100.6 ms at reduce 1 — 3%. Per-frame cost is dominated by the
+    /// grk_decompress process (spawn + temp file + pipe), not by the pixels, so
+    /// decoding a preview-sized picture threw away half the resolution in each
+    /// direction to save nothing. 2K and below therefore decode FULL RES.
+    ///
+    /// 4K still reduces once — 4× the pixel work is the one case where the
+    /// pixel term stops being noise — which lands it at 2K, the display's
+    /// resolution anyway.
     public var previewReduceLevel: Int {
-        if width >= 3600 { return 2 }
-        if width >= 1600 { return 1 }
+        if width >= 3600 { return 1 }
         return 0
     }
 }

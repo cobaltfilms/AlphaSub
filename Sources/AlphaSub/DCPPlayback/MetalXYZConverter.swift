@@ -80,19 +80,21 @@ final class MetalXYZConverter: @unchecked Sendable {
         let w = info.width, h = info.height
 
         // Shared-state section: pool + texture cache only.
-        let prepared: (CVPixelBuffer, MTLTexture)? = {
+        //
+        // The CVMetalTexture wrapper is carried out of here and kept alive
+        // until the GPU is done (see withExtendedLifetime below). Dropping it
+        // early leaves the cache free to recycle the texture's backing while
+        // another thread's command buffer is still writing to it — which, now
+        // that conversions run concurrently, shows up as bands of a different
+        // frame smeared across the picture.
+        let prepared: (CVPixelBuffer, CVMetalTexture, MTLTexture)? = {
             lock.lock()
             defer { lock.unlock() }
             guard let pb = makePixelBuffer(width: w, height: h),
-                  let tex = makeTexture(from: pb, width: w, height: h) else { return nil }
-            conversionsSinceFlush += 1
-            if conversionsSinceFlush >= 64 {
-                CVMetalTextureCacheFlush(textureCache, 0)
-                conversionsSinceFlush = 0
-            }
-            return (pb, tex)
+                  let (cvTex, tex) = makeTexture(from: pb, width: w, height: h) else { return nil }
+            return (pb, cvTex, tex)
         }()
-        guard let (pixelBuffer, outTexture) = prepared else { return nil }
+        guard let (pixelBuffer, cvTexture, outTexture) = prepared else { return nil }
 
         // Upload the planar samples ZERO-COPY (shared storage on Apple GPUs).
         // Safe with bytesNoCopy because waitUntilCompleted() below keeps the
@@ -104,7 +106,8 @@ final class MetalXYZConverter: @unchecked Sendable {
         // (unusual reduce level, non-2K geometry) does not. Copy in that case
         // rather than hand Metal an invalid buffer — a few hundred µs beats a
         // nil buffer that silently demotes the whole conversion to the CPU.
-        return frame.planarData.withUnsafeBytes { raw in
+        return withExtendedLifetime(cvTexture) {
+        return frame.planarData.withUnsafeBytes { raw -> CVPixelBuffer? in
             guard let base = raw.baseAddress, raw.count > 0 else { return nil }
             let page = Int(getpagesize())
             let canAlias = Int(bitPattern: base) % page == 0 && raw.count % page == 0
@@ -133,6 +136,7 @@ final class MetalXYZConverter: @unchecked Sendable {
             guard cmd.status == .completed else { return nil }
             return pixelBuffer
         }
+        }
     }
 
     // MARK: Buffers
@@ -160,13 +164,19 @@ final class MetalXYZConverter: @unchecked Sendable {
         return pb
     }
 
-    private func makeTexture(from pb: CVPixelBuffer, width: Int, height: Int) -> MTLTexture? {
+    /// Returns the CVMetalTexture WITH its MTLTexture — the caller must keep
+    /// the wrapper alive for as long as the GPU uses the texture. Returning
+    /// the MTLTexture alone lets the wrapper deallocate immediately, and the
+    /// texture cache is then free to recycle backing store out from under an
+    /// in-flight command buffer.
+    private func makeTexture(from pb: CVPixelBuffer, width: Int,
+                             height: Int) -> (CVMetalTexture, MTLTexture)? {
         var cvTex: CVMetalTexture?
         let status = CVMetalTextureCacheCreateTextureFromImage(
             kCFAllocatorDefault, textureCache, pb, nil,
             .bgra8Unorm, width, height, 0, &cvTex)
         guard status == kCVReturnSuccess, let cvTex,
               let tex = CVMetalTextureGetTexture(cvTex) else { return nil }
-        return tex
+        return (cvTex, tex)
     }
 }

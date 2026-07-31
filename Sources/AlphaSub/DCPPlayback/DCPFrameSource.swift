@@ -136,15 +136,7 @@ public actor DCPFrameSource {
             throw MXFPictureReader.ReaderError.noPictureFrames
         }
         let concurrency = max(1, maxConcurrentDecodes)
-        // Thread budget: what hits the scheduler is decodes × threads-per-
-        // decode, not either alone. A decoder left on its own default gets
-        // rescaled so the product stays around the core count; an explicitly
-        // configured decoder (offline export, tests) is honoured as given.
-        var budgeted = decoder
-        if budgeted.threadCount == GrokDecoder.defaultThreadCount {
-            budgeted.threadCount = Self.playbackThreadCount(concurrency: concurrency)
-        }
-        self.decoder = budgeted
+        self.decoder = decoder
         self.capacity = max(4, cacheCapacity)
         self.gate = DecodeGate(limit: concurrency)
 
@@ -178,21 +170,15 @@ public actor DCPFrameSource {
         }
     }
 
-    /// Intra-frame decode threads for playback: the core budget split across
-    /// the concurrent decodes, capped at 4 (Grok's own returns flatten past
-    /// that). 10 cores ÷ 3 decodes → 3 threads each ≈ one core per thread,
-    /// which leaves the UI and the display loop room to run.
-    public static func playbackThreadCount(concurrency: Int) -> Int {
-        let cores = ProcessInfo.processInfo.activeProcessorCount
-        return max(1, min(4, cores / max(1, concurrency)))
-    }
-
     public static var defaultConcurrency: Int {
-        // Keep decode gentle: ~250 fps of headroom means a handful of workers
-        // sustains 24 fps with a buffer, while leaving CPU/cores for the main
-        // thread (UI + timecode). Saturating all cores starves the UI.
+        // Each decode is a single-threaded grk_decompress process costing
+        // ~104 ms for a full-res 2K frame (measured), so 24 fps needs at least
+        // 2.5 of them in flight; below that the picture stutters no matter how
+        // fast the display loop runs. Five gives ~48 fps of headroom for
+        // shuttle and seek while still leaving cores for the UI and the
+        // timecode — saturating every core starves the main thread.
         let perf = ProcessInfo.processInfo.activeProcessorCount
-        return max(2, min(4, perf / 3))
+        return max(3, min(6, perf / 2))
     }
 
     public var isAvailable: Bool { decoder.isAvailable }
