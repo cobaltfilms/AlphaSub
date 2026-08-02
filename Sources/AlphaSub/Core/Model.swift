@@ -1221,6 +1221,30 @@ public struct SubtitleDocument: Codable {
         return repaired
     }
 
+    /// Copy the *media linkage* from `other` onto this document: which media
+    /// file is linked, its detected shot changes, counting leader and
+    /// programme start, plus any feature payloads named in `featureKeys`
+    /// (the DCP composition).
+    ///
+    /// Linkage is not editing state — it is established by loading media and
+    /// by detection runs, none of which take an undo snapshot. Because it
+    /// rides inside the document, restoring an undo snapshot would otherwise
+    /// revert it to whatever was linked when that snapshot was taken (usually
+    /// nothing), silently unlinking the video and saving a project with no
+    /// media reference. Undo/redo therefore hand the *live* linkage forward.
+    public mutating func adoptMediaLink(from other: SubtitleDocument,
+                                        featureKeys: [String] = []) {
+        mediaReference = other.mediaReference
+        guard !featureKeys.isEmpty else { return }
+        var meta = featureMetadata ?? [:]
+        for key in featureKeys {
+            // Mirror exactly, removals included, so the linkage after a restore
+            // is precisely what it was before it.
+            meta[key] = other.featureMetadata?[key]
+        }
+        featureMetadata = meta.isEmpty ? nil : meta
+    }
+
     public mutating func offsetAll(by offset: Timecode) {
         tracks = tracks.map { $0.offsetAll(by: offset) }
     }
