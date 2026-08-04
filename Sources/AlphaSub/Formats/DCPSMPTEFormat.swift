@@ -570,13 +570,13 @@ public struct DCPSMPTEExporter: FormatExporter {
         return data
     }
 
-    /// Round-trip the reel's `<StartTime>`: an imported hour-based reel keeps
-    /// its declared origin (held as the track's timecode offset); everything
-    /// else exports the standard zero start.
+    /// `<StartTime>` is always the zero origin. Not every player/server honours
+    /// a non-zero reel start — those that do subtract it from every TimeIn,
+    /// rebasing the whole reel and throwing the subtitles out of sync, and
+    /// those that don't ignore it silently. A track's `timecodeOffset` (left by
+    /// an offset, a resync or a timebase shift) must therefore never leak in
+    /// here: the shift already lives in the cue timecodes.
     private static func startTimeString(for track: Track) -> String {
-        if let offset = track.timecodeOffset, offset.totalFrames > 0 {
-            return formatSMPTE428Time(offset)
-        }
         return "00:00:00:00"
     }
 
