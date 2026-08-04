@@ -25,6 +25,10 @@ public struct FormatID: RawRepresentable, Hashable, Codable, Sendable {
     public static let ttml_amazon   = FormatID(rawValue: "ttml_amazon")
     public static let ttml_itunes  = FormatID(rawValue: "ttml_itunes")
     public static let ttml_davinci = FormatID(rawValue: "ttml_davinci")
+    /// Subtitles as a transparent PNG per cue plus a conform list — the
+    /// delivery an online suite needs when the text has to be composited as
+    /// picture rather than passed as a text track.
+    public static let png_sequence = FormatID(rawValue: "png_sequence")
 
     // Video containers
     public static let mov = FormatID(rawValue: "mov")

@@ -100,8 +100,10 @@ public struct DCPInterOpImporter: FormatImporter {
             let textElems = DCPTextTree.texts(in: subElem)
             var textBlocks: [TextBlock] = []
 
-            for (textElem, inheritedStyle) in textElems {
-                let segments = parseInteropTextSegments(textElem, baseStyle: inheritedStyle)
+            for (textElem, inheritedStyle, inheritedColor) in textElems {
+                let segments = parseInteropTextSegments(textElem,
+                                                        baseStyle: inheritedStyle,
+                                                        baseColor: inheritedColor)
                 textBlocks.append(TextBlock(segments: segments))
             }
 
@@ -229,7 +231,9 @@ public struct DCPInterOpImporter: FormatImporter {
         return InteropPosition(vertical: vpos, horizontal: hpos, alignment: align, hasCustomPosition: hasCustom)
     }
 
-    private static func parseInteropTextSegments(_ textElem: XMLElement, baseStyle: TextStyle = []) -> [TextSegment] {
+    private static func parseInteropTextSegments(_ textElem: XMLElement,
+                                                 baseStyle: TextStyle = [],
+                                                 baseColor: TextColor? = nil) -> [TextSegment] {
         var segments: [TextSegment] = []
 
         for child in (textElem.children ?? []).compactMap({ $0 as? XMLElement }) {
@@ -238,15 +242,18 @@ public struct DCPInterOpImporter: FormatImporter {
                 var style: TextStyle = baseStyle
                 if child.attribute(forName: "Italic")?.stringValue == "yes" { style.insert(.italic) }
                 if child.attribute(forName: "Weight")?.stringValue == "bold" { style.insert(.bold) }
+                // Colour was being dropped here too (#50).
+                let color = child.attribute(forName: "Color")?.stringValue
+                    .flatMap(DCPColor.textColor(fromHex:)) ?? baseColor
                 if let text = child.stringValue?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines), !text.isEmpty {
-                    segments.append(TextSegment(text: text, style: style))
+                    segments.append(TextSegment(text: text, style: style, color: color))
                 }
             }
         }
 
         if segments.isEmpty {
             if let text = textElem.stringValue?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines), !text.isEmpty {
-                segments.append(TextSegment(text: text, style: baseStyle))
+                segments.append(TextSegment(text: text, style: baseStyle, color: baseColor))
             }
         }
 
@@ -465,10 +472,16 @@ public struct DCPInterOpExporter: FormatExporter {
                 let halign = placement.halign
                 let valign = formatInteropVAlign(effective.vertical)
                 let plainText = block.segments.map { segment in
-                    if segment.style.contains(.italic) {
-                        return "<Font Italic=\"yes\">\(escapeXML(segment.text))</Font>"
+                    // Italics and per-run colour both ride on a wrapping <Font>;
+                    // the colour only needs writing when it differs from the
+                    // track default already set on the outer <Font> (#50).
+                    var attrs = ""
+                    if segment.style.contains(.italic) { attrs += " Italic=\"yes\"" }
+                    if let c = segment.color, DCPColor.hex(from: c) != fontColor.uppercased() {
+                        attrs += " Color=\"\(DCPColor.hex(from: c))\""
                     }
-                    return escapeXML(segment.text)
+                    guard !attrs.isEmpty else { return escapeXML(segment.text) }
+                    return "<Font\(attrs)>\(escapeXML(segment.text))</Font>"
                 }.joined()
 
                 xml += """

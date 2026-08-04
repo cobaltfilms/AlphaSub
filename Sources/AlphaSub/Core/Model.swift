@@ -186,7 +186,10 @@ public struct Timecode: Codable, Equatable, Comparable, Hashable {
             if let match = try? msPattern.wholeMatch(in: trimmed) {
                 let h = Int(match.1)!, m = Int(match.2)!, s = Int(match.3)!, ms = Int(match.4)!
                 let total = Double(h * 3600 + m * 60 + s) + Double(ms) / 1000.0
-                return Timecode.fromSeconds(total, frameRate: frameRate)
+                // Millisecond stamps are authored frame boundaries rounded to
+                // whole milliseconds, so snap to the closest frame rather than
+                // flooring — otherwise a 1 ms writer error costs a whole frame.
+                return Timecode.fromSeconds(total, frameRate: frameRate, rounding: .nearest)
             }
         }
 
@@ -206,8 +209,111 @@ public struct Timecode: Codable, Equatable, Comparable, Hashable {
         return Timecode(totalFrames: sign * base.totalFrames, frameRate: frameRate)
     }
 
-    public static func fromSeconds(_ seconds: Double, frameRate: FrameRate) -> Timecode {
-        let frames = Int64(seconds * frameRate.value)
+    /// How a wall-clock instant that falls between two frames is resolved.
+    public enum FrameRounding {
+        /// The frame currently on screen at that instant — what playback wants.
+        case floor
+        /// The closest frame boundary. What *authored* times want: a subtitle
+        /// file's millisecond stamps are frame boundaries written with ≤1 ms of
+        /// rounding error (Resolve writes 01,239 for a frame that truly lands on
+        /// 01,240), and flooring turns that 1 ms into a whole lost frame.
+        case nearest
+    }
+
+    /// Parse a timecode the way Resolve and Annotation Edit do — forgiving of
+    /// everything a person actually types into a timecode field.
+    ///
+    /// Strict `parse(_:frameRate:)` is tried first, so anything well-formed is
+    /// unaffected. Beyond that:
+    ///
+    /// - **No separators.** Digits fill from the right, frames first:
+    ///   `12` → 12 frames, `1000` → 10 s, `12345` → 1 min 23 s 45 fr.
+    /// - **Partial separators.** Missing leading fields are zero:
+    ///   `1:00` → 1 s, `10:00:00` → 10 min.
+    /// - **Trailing dots** shift left one field each, so `1.` is a second,
+    ///   `1..` a minute, `1...` an hour.
+    /// - **A minus anywhere** makes the whole value negative, so the
+    ///   `00:00:-1:00` people type into an offset field means minus one second.
+    /// - **Overflowing fields** carry: `00:00:90:00` is 1 min 30 s.
+    /// - Stray spaces, and `.`/`;`/`,` used as separators, are accepted.
+    ///
+    /// Returns nil rather than throwing: every caller here is validating live
+    /// keystrokes, where "not a timecode yet" is the normal state.
+    public static func parseLenient(_ string: String, frameRate: FrameRate) -> Timecode? {
+        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        // Well-formed input keeps its exact existing meaning, including the
+        // HH:MM:SS,mmm millisecond form and drop-frame ";" labels.
+        let negative = trimmed.contains("-")
+        let unsigned = trimmed.replacingOccurrences(of: "-", with: "")
+                              .replacingOccurrences(of: "+", with: "")
+                              .trimmingCharacters(in: .whitespaces)
+        if let strict = try? parse(unsigned, frameRate: frameRate) {
+            return negative ? Timecode(totalFrames: -strict.totalFrames, frameRate: frameRate) : strict
+        }
+
+        // Trailing dots are a "shift left" shorthand: each one promotes the
+        // typed number to the next field up.
+        var body = unsigned
+        var promotions = 0
+        while body.hasSuffix(".") {
+            body.removeLast()
+            promotions += 1
+        }
+        guard !body.isEmpty else { return nil }
+
+        var fields: [Int]
+        if body.contains(where: { ":;,.".contains($0) }) {
+            let parts = body.split(whereSeparator: { ":;,.".contains($0) }).map(String.init)
+            guard parts.count <= 4, parts.allSatisfy({ !$0.isEmpty && $0.allSatisfy(\.isNumber) }),
+                  let values = try? parts.map({ part -> Int in
+                      guard let v = Int(part) else { throw TimecodeError.invalidFormat(string) }
+                      return v
+                  })
+            else { return nil }
+            fields = values
+        } else {
+            // Bare digits fill from the right in pairs: …HHMMSSFF.
+            guard body.allSatisfy(\.isNumber), body.count <= 8 else { return nil }
+            var digits = Array(body)
+            fields = []
+            while !digits.isEmpty {
+                let take = min(2, digits.count)
+                let chunk = String(digits.suffix(take))
+                digits.removeLast(take)
+                guard let v = Int(chunk) else { return nil }
+                fields.insert(v, at: 0)
+            }
+        }
+
+        // Promote for trailing dots, then right-align into (h, m, s, f).
+        fields.append(contentsOf: Array(repeating: 0, count: promotions))
+        guard fields.count <= 4 else { return nil }
+        let padded = Array(repeating: 0, count: 4 - fields.count) + fields
+        let (h, m, s, f) = (padded[0], padded[1], padded[2], padded[3])
+
+        // Carry overflowing fields (90 seconds → 1 min 30 s) before handing the
+        // components to the initialiser, which expects real SMPTE labels.
+        let fps = max(1, frameRate.nominalFPS)
+        var totalSeconds = h * 3600 + m * 60 + s + f / fps
+        let frames = f % fps
+        guard totalSeconds >= 0 else { return nil }
+        let ch = totalSeconds / 3600
+        totalSeconds %= 3600
+        let tc = Timecode(h: ch, m: totalSeconds / 60, s: totalSeconds % 60, f: frames, frameRate: frameRate)
+        return negative ? Timecode(totalFrames: -tc.totalFrames, frameRate: frameRate) : tc
+    }
+
+    public static func fromSeconds(_ seconds: Double,
+                                   frameRate: FrameRate,
+                                   rounding: FrameRounding = .floor) -> Timecode {
+        let exact = seconds * frameRate.value
+        let frames: Int64
+        switch rounding {
+        case .floor:   frames = Int64(exact)
+        case .nearest: frames = Int64(exact.rounded())
+        }
         return Timecode(totalFrames: frames, frameRate: frameRate)
     }
 
@@ -239,8 +345,12 @@ public struct Timecode: Codable, Equatable, Comparable, Hashable {
         return Timecode(totalFrames: totalFrames + converted.totalFrames, frameRate: frameRate)
     }
 
+    /// Re-express this instant on another rate's frame grid, keeping wall-clock
+    /// time. Rounds to the nearest frame: this timecode already *is* a frame
+    /// boundary, so the honest answer is the closest frame at the new rate, and
+    /// flooring would bias every converted cue one frame early.
     public func converted(to newFrameRate: FrameRate) -> Timecode {
-        return Timecode.fromSeconds(seconds, frameRate: newFrameRate)
+        return Timecode.fromSeconds(seconds, frameRate: newFrameRate, rounding: .nearest)
     }
 
     /// Re-express this timecode at a new frame rate while KEEPING the on-screen

@@ -22,7 +22,32 @@ import AlphaSubCore
 /// anchored cues. This composes the anchor and anchor-relative offset into
 /// AlphaSub's left-origin `HorizontalPosition` (0 % = left edge, 50 % =
 /// centre, 100 % = right edge) and back, keeping the two formats consistent.
-enum DCPHorizontal {
+/// Colour conversion for the two DCP subtitle formats.
+///
+/// DCP writes colours as `AARRGGBB` — **alpha first**, which is the reverse of
+/// the `#RRGGBBAA` `TextColor(hex:)` accepts. Passing one to the other rotates
+/// every channel, so the conversion lives here and both importers and exporters
+/// go through it.
+enum DCPColor {
+    /// `AARRGGBB` or bare `RRGGBB` → `TextColor`. Alpha is discarded: the model
+    /// carries opaque colours only, and DCP subtitle text is always opaque.
+    static func textColor(fromHex hex: String) -> TextColor? {
+        let clean = hex.trimmingCharacters(in: CharacterSet(charactersIn: "# \n\t\r"))
+        guard !clean.isEmpty, clean.allSatisfy({ $0.isHexDigit }) else { return nil }
+        switch clean.count {
+        case 8: return TextColor(hex: String(clean.dropFirst(2)))
+        case 6: return TextColor(hex: clean)
+        default: return nil
+        }
+    }
+
+    /// `TextColor` → opaque `FFRRGGBB`, uppercase, as DCP expects.
+    static func hex(from color: TextColor) -> String {
+        String(format: "FF%02X%02X%02X", color.r, color.g, color.b)
+    }
+}
+
+public enum DCPHorizontal {
     static func placement(halign: String?, hposition: Double?) -> (HorizontalPosition, TextAlignment) {
         let ha = (halign ?? "center").trimmingCharacters(in: .whitespaces).lowercased()
         let hp = hposition ?? 0
@@ -52,8 +77,8 @@ enum DCPHorizontal {
     /// `Hposition` so exports match the spec (a centred cue writes
     /// `Halign="center" Hposition="0.0"`, not `Hposition="50.0"`; a left cue at
     /// 10 % writes `Halign="left" Hposition="10.0"`).
-    static func attributes(horizontal: HorizontalPosition,
-                           alignment: TextAlignment) -> (halign: String, hposition: Double) {
+    public static func attributes(horizontal: HorizontalPosition,
+                                  alignment: TextAlignment) -> (halign: String, hposition: Double) {
         let screenPct: Double
         switch horizontal {
         case .centered:          screenPct = 50
@@ -69,6 +94,30 @@ enum DCPHorizontal {
     }
 }
 
+/// Shared vertical placement between AlphaSub's model and the DCP dialects.
+///
+/// AlphaSub stores vertical position as "percent down from the top"; both DCP
+/// formats write `Valign` plus a `Vposition` measured *from that anchor*. The
+/// two read nothing like each other, which is why the app's percentages looked
+/// unrelated to the numbers in the XML (#50). The editor uses this to show the
+/// exact pair a cue will export as, next to the percentage it edits.
+public enum DCPVertical {
+    public static func attributes(vertical: VerticalPosition,
+                                  baseVPosition: Double = 8.0) -> (valign: String, vposition: Double) {
+        switch vertical {
+        case .safeArea(.top):    return ("top", baseVPosition)
+        case .safeArea(.center): return ("center", 50.0)
+        case .safeArea(.bottom): return ("bottom", baseVPosition)
+        case .percentage(let pct):
+            // Model 0 = top; DCP bottom-anchored Vposition counts up from the
+            // bottom edge, so the two are complements.
+            return ("bottom", max(1.0, min(100.0, 100.0 - pct)))
+        case .row(let r):        return ("top", Double(r))
+        case .lineShift:         return ("bottom", baseVPosition)
+        }
+    }
+}
+
 /// Shared `<Text>` discovery for the two DCP subtitle importers.
 ///
 /// In both DCP dialects a `<Font>` element may appear at ANY level — including
@@ -79,19 +128,23 @@ enum DCPHorizontal {
 /// accumulating the Font style (Italic/Weight) each `<Text>` inherits.
 enum DCPTextTree {
     /// All `<Text>` descendants of a `<Subtitle>` element in document order,
-    /// each paired with the style inherited from wrapping `<Font>` elements.
-    static func texts(in subtitleElem: XMLElement) -> [(elem: XMLElement, inheritedStyle: TextStyle)] {
-        var result: [(XMLElement, TextStyle)] = []
-        collect(subtitleElem, inherited: [], into: &result)
+    /// each paired with the style and colour inherited from wrapping `<Font>`
+    /// elements. Colour is carried alongside style because a whole-cue colour is
+    /// written exactly like whole-cue italics — on a `<Font>` that wraps the
+    /// `<Text>` rather than on the run itself (#50).
+    static func texts(in subtitleElem: XMLElement) -> [(elem: XMLElement, inheritedStyle: TextStyle, inheritedColor: TextColor?)] {
+        var result: [(XMLElement, TextStyle, TextColor?)] = []
+        collect(subtitleElem, inherited: [], inheritedColor: nil, into: &result)
         return result
     }
 
     private static func collect(_ elem: XMLElement, inherited: TextStyle,
-                                into result: inout [(XMLElement, TextStyle)]) {
+                                inheritedColor: TextColor?,
+                                into result: inout [(XMLElement, TextStyle, TextColor?)]) {
         for child in (elem.children ?? []).compactMap({ $0 as? XMLElement }) {
             switch localName(child.name) {
             case "Text":
-                result.append((child, inherited))
+                result.append((child, inherited, inheritedColor))
             case "Font":
                 var style = inherited
                 switch child.attribute(forName: "Italic")?.stringValue?.lowercased() {
@@ -109,7 +162,9 @@ enum DCPTextTree {
                 case "no":  style.remove(.underline)
                 default:    break
                 }
-                collect(child, inherited: style, into: &result)
+                let color = child.attribute(forName: "Color")?.stringValue
+                    .flatMap(DCPColor.textColor(fromHex:)) ?? inheritedColor
+                collect(child, inherited: style, inheritedColor: color, into: &result)
             default:
                 // Ruby/Space/etc. — do not descend; Text never hides in them.
                 continue

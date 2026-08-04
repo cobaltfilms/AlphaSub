@@ -140,7 +140,7 @@ public struct DCPSMPTEImporter: FormatImporter {
             // <Text> may be wrapped in <Font> elements inside <Subtitle> (the
             // standard way whole-cue italics are written) — walk the subtree
             // instead of only the direct children, inheriting the Font style.
-            for (textElem, inheritedStyle) in DCPTextTree.texts(in: subElem) {
+            for (textElem, inheritedStyle, inheritedColor) in DCPTextTree.texts(in: subElem) {
                 let vpos = parseVPosition(textElem)
                 vposSum += vpos
                 vposCount += 1
@@ -166,7 +166,9 @@ public struct DCPSMPTEImporter: FormatImporter {
                     hasPositionData = true
                 }
 
-                let segments = parseDCPTextSegments(textElem, baseStyle: inheritedStyle)
+                let segments = parseDCPTextSegments(textElem,
+                                                    baseStyle: inheritedStyle,
+                                                    baseColor: inheritedColor)
                 textBlocks.append(TextBlock(segments: segments))
             }
 
@@ -316,7 +318,9 @@ public struct DCPSMPTEImporter: FormatImporter {
         return 8.0
     }
 
-    private static func parseDCPTextSegments(_ textElem: XMLElement, baseStyle: TextStyle = []) -> [TextSegment] {
+    private static func parseDCPTextSegments(_ textElem: XMLElement,
+                                             baseStyle: TextStyle = [],
+                                             baseColor: TextColor? = nil) -> [TextSegment] {
         var segments: [TextSegment] = []
 
         for child in (textElem.children ?? []).compactMap({ $0 as? XMLElement }) {
@@ -327,21 +331,27 @@ public struct DCPSMPTEImporter: FormatImporter {
                 var style: TextStyle = baseStyle
                 if isItalic { style.insert(.italic) }
                 if isBold { style.insert(.bold) }
+                // A per-run Color overrides whatever the enclosing Font set —
+                // this is how coloured speaker cues are written, and dropping it
+                // was why imported colours never showed anywhere (#50).
+                let color = child.attribute(forName: "Color")?.stringValue
+                    .flatMap(DCPColor.textColor(fromHex:)) ?? baseColor
 
                 if let text = child.stringValue?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines), !text.isEmpty {
-                    segments.append(TextSegment(text: text, style: style))
+                    segments.append(TextSegment(text: text, style: style, color: color))
                 }
             }
         }
 
         if segments.isEmpty {
             if let text = textElem.stringValue?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines), !text.isEmpty {
-                segments.append(TextSegment(text: text, style: baseStyle))
+                segments.append(TextSegment(text: text, style: baseStyle, color: baseColor))
             }
         }
 
         return segments
     }
+
 
     private static func findElement(_ root: XMLElement, localName: String) -> XMLElement? {
         func walk(_ elem: XMLElement) -> XMLElement? {
@@ -517,10 +527,18 @@ public struct DCPSMPTEExporter: FormatExporter {
                 let halignStr = placement.halign
                 let valignStr = formatSMPTEVAlign(effective.vertical)
                 let plainText = block.segments.map { segment in
-                    if segment.style.contains(.italic) {
-                        return "<Font Italic=\"yes\">\(escapeXML(segment.text))</Font>"
+                    // Wrap the run in a <Font> when it carries italics or a
+                    // colour of its own; without the colour attribute a coloured
+                    // cue came back white on the next round trip (#50). The
+                    // enclosing <Font> already sets the track's default colour,
+                    // so only a *different* colour needs writing here.
+                    var attrs = ""
+                    if segment.style.contains(.italic) { attrs += " Italic=\"yes\"" }
+                    if let c = segment.color, DCPColor.hex(from: c) != fontColor.uppercased() {
+                        attrs += " Color=\"\(DCPColor.hex(from: c))\""
                     }
-                    return escapeXML(segment.text)
+                    guard !attrs.isEmpty else { return escapeXML(segment.text) }
+                    return "<Font\(attrs)>\(escapeXML(segment.text))</Font>"
                 }.joined()
 
                 if schemaVersion.supportsTextDirection {
