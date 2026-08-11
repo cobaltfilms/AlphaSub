@@ -32,6 +32,13 @@ public final class DCPPlayer: ObservableObject {
     private let clock: DCPPlaybackClock
     private var loop: DCPDisplayLoop?
 
+    /// Frames shown and frames thrown away since this player was created, for
+    /// the statistics panel. Zero until the display loop exists (it starts with
+    /// the first layer or frame hook), which is also the honest answer.
+    public var frameTotals: (presented: Int, dropped: Int) {
+        loop?.counters.totals ?? (0, 0)
+    }
+
     public convenience init(pictureURL: URL, fps: Double, pictureKey: Data? = nil,
                              cacheCapacity: Int = 64) throws {
         let source = try DCPFrameSource(pictureURL: pictureURL, pictureKey: pictureKey,

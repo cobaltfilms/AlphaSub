@@ -13,7 +13,42 @@ import CoreVideo
 // (e.g. the live AVPlayer time), read off-main. AVSampleBufferDisplayLayer.
 // enqueue is thread-safe, so nothing here touches the main thread.
 
+/// Running totals of what the display loop did with each frame.
+///
+/// Written on the display queue, read from the main actor a couple of times a
+/// second by the statistics panel — hence a lock rather than bare `Int`s. The
+/// lock is uncontended and held for one increment, which is the cheapest thing
+/// that is also correct; nothing here allocates, so it is safe on the display
+/// queue at frame rate.
+public final class DCPFrameCounters: @unchecked Sendable {
+    private let lock = NSLock()
+    private var presentedCount = 0
+    private var droppedCount = 0
+
+    public init() {}
+
+    func recordPresented() {
+        lock.lock(); presentedCount += 1; lock.unlock()
+    }
+
+    /// A frame that was decoded but never shown: the playhead had already moved
+    /// past it, or the decode failed outright. Only counted while playing —
+    /// during a scrub, superseded frames are the mechanism working, not a fault.
+    func recordDropped() {
+        lock.lock(); droppedCount += 1; lock.unlock()
+    }
+
+    /// `(shown, thrown away)` since this player was created.
+    public var totals: (presented: Int, dropped: Int) {
+        lock.lock(); defer { lock.unlock() }
+        return (presentedCount, droppedCount)
+    }
+}
+
 final class DCPDisplayLoop: @unchecked Sendable {
+
+    /// Shared with the owning DCPPlayer so the host can sample it.
+    let counters = DCPFrameCounters()
 
     /// Output layers — main video area, fullscreen, detached window — all fed
     /// the same frames. Mutated only on `queue`.
@@ -116,13 +151,25 @@ final class DCPDisplayLoop: @unchecked Sendable {
         guard force || frame != lastFrame else { return }
         lastFrame = frame
         Task { [weak self] in
-            guard let self, let f = try? await self.source.frame(at: frame) else { return }
+            guard let self else { return }
+            guard let f = try? await self.source.frame(at: frame) else {
+                if playing { self.counters.recordDropped() }
+                return
+            }
             // The fetch is async; by the time it returns the playhead may have
             // moved on. Only present it if it's still the current frame — this
             // prevents an out-of-order stale frame flashing (a perceived drop).
             self.queue.async {
-                guard self.lastFrame == frame else { return }
+                guard self.lastFrame == frame else {
+                    // Decoded too late to be of use. While playing that is a
+                    // genuine dropped frame; while scrubbing it is the loop
+                    // discarding work the operator has already moved past, and
+                    // counting it would bury the signal in noise.
+                    if playing { self.counters.recordDropped() }
+                    return
+                }
                 self.enqueue(f.pixelBuffer)
+                self.counters.recordPresented()
             }
         }
     }
