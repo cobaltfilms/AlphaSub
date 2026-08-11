@@ -1,6 +1,6 @@
 # Third-Party Components & Source Offer
 
-AlphaSub bundles or links the open-source components below. This document is
+AlphaSUB bundles or links the open-source components below. This document is
 the **written source offer** required by the LGPL/AGPL for the components we
 redistribute in binary form. The same information is available inside the app
 under **Help ▸ Open-Source Components…**, and the verbatim license texts ship
@@ -8,7 +8,7 @@ inside the app bundle next to each binary.
 
 ## Bundled subprocess tools
 
-These run as **separate helper processes**; none is linked into AlphaSub.
+These run as **separate helper processes**; none is linked into AlphaSUB.
 
 ### ffmpeg / ffprobe — LGPL-2.1-or-later
 - **Version:** 7.1, built from the unmodified upstream tarball
@@ -60,7 +60,7 @@ Dictionaries are data files read by the app; they are not linked code.
 | FluidAudio | <https://github.com/FluidInference/FluidAudio> | Apache-2.0 |
 | WhisperKit (argmax-oss fork) | <https://github.com/argmaxinc/WhisperKit> | MIT |
 
-No copyleft code is linked into the AlphaSub binary.
+No copyleft code is linked into the AlphaSUB binary.
 
 ---
 If you cannot access any of the URLs above, write to <info@cobaltfilms.be> and

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # build-asdcp-tools.sh — build asdcplib's `asdcp-unwrap` + `asdcp-info` CLI tools
-# and bundle them (self-contained) into Sources/AlphaSub/App/Resources/asdcp/,
+# and bundle them (self-contained) into Sources/AlphaSubToolBinaries/Resources/asdcp/,
 # so ClairMeta can do DEEP subtitle-content inspection during DCP QC without a
 # Homebrew asdcplib install. (DCPValidator prepends this dir to ClairMeta's PATH.)
 #
@@ -18,7 +18,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DEST="$ROOT/Sources/AlphaSub/App/Resources/asdcp"
+DEST="$ROOT/Sources/AlphaSubToolBinaries/Resources/asdcp"
 WORK="${ASDCP_WORK_DIR:-$HOME/.cache/alphasub-asdcp-tools}"
 OPENSSL_PREFIX="${OPENSSL_PREFIX:-/opt/homebrew/opt/openssl@3}"
 LIBC="$OPENSSL_PREFIX/lib/libcrypto.3.dylib"

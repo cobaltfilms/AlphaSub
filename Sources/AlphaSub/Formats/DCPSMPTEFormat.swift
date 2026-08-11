@@ -145,6 +145,14 @@ public struct DCPSMPTEImporter: FormatImporter {
                 vposSum += vpos
                 vposCount += 1
 
+                // Per-line position: ST 428-7 carries Vposition/Valign (and
+                // Hposition/Halign) on EVERY <Text>, and a player draws each
+                // line at its own position. Keep those on the block so the
+                // preview can do the same; the cue-level derivation below is
+                // untouched and stays the fallback for every consumer.
+                var blockVertical: VerticalPosition? = nil
+                var blockHorizontal: HorizontalPosition? = nil
+
                 let halignStr = textElem.attribute(forName: "Halign")?.stringValue
                 let hposVal = textElem.attribute(forName: "Hposition")?.stringValue.flatMap(Double.init)
                 if halignStr != nil || hposVal != nil {
@@ -155,6 +163,7 @@ public struct DCPSMPTEImporter: FormatImporter {
                     let placement = DCPHorizontal.placement(halign: halignStr, hposition: hposVal)
                     parsedHpos = placement.0
                     parsedAlign = placement.1
+                    blockHorizontal = placement.0
                     hasPositionData = true
                 }
                 if let va = textElem.attribute(forName: "Valign")?.stringValue {
@@ -165,11 +174,31 @@ public struct DCPSMPTEImporter: FormatImporter {
                     }
                     hasPositionData = true
                 }
+                // A line only claims its own vertical position when the element
+                // actually carries Vposition or Valign; otherwise it defers to
+                // the cue's (nil). The anchor is THIS element's Valign only
+                // (absent = bottom, the spec default) — not whatever a sibling
+                // line declared. Same conversion as the cue-level resolve
+                // below: model percentage is 0 = top, 100 = bottom.
+                let lineValign = textElem.attribute(forName: "Valign")?.stringValue?.lowercased()
+                let hasOwnV = textElem.attribute(forName: "Vposition")?.stringValue != nil
+                    || lineValign != nil
+                if hasOwnV {
+                    let pct: Double
+                    switch lineValign {
+                    case "top":    pct = vpos
+                    case "center": pct = 50.0
+                    default:       pct = 100.0 - vpos
+                    }
+                    blockVertical = .percentage(max(0.0, min(100.0, pct)))
+                }
 
                 let segments = parseDCPTextSegments(textElem,
                                                     baseStyle: inheritedStyle,
                                                     baseColor: inheritedColor)
-                textBlocks.append(TextBlock(segments: segments))
+                textBlocks.append(TextBlock(segments: segments,
+                                            verticalPosition: blockVertical,
+                                            horizontalPosition: blockHorizontal))
             }
 
             // Resolve vertical position:
@@ -413,6 +442,9 @@ public struct DCPSMPTEExporter: FormatExporter {
             ?? track.metadata["dcp_font_urn"]
             ?? "urn:uuid:d86e5ebf-8697-4f0d-b44f-b78a64437d36"
         let fontColor = track.metadata["dcp_font_color"] ?? "FFF2F2F2"
+        // Resolved once per track, not per <Text>: the direction is a property
+        // of the language, and ST 428-7 has no notion of it changing mid-cue.
+        let textDirection = smpteDirection(for: track.language.rawValue, options: options)
         let fontEffect: String
         let fontEffectColor: String
         if let bw = opts.borderWidth, bw > 0 {
@@ -540,16 +572,24 @@ public struct DCPSMPTEExporter: FormatExporter {
                     guard !attrs.isEmpty else { return escapeXML(segment.text) }
                     return "<Font\(attrs)>\(escapeXML(segment.text))</Font>"
                 }.joined()
+                // ST 428-7 allows an empty <Text>, but easyDCP rejects the
+                // whole subtitle document for it — "this might prevent the
+                // whole document from being displayed on some servers" — and
+                // that is the failure mode that matters. A placeholder cue is
+                // meant to be non-printing, not absent, so the invariant is
+                // enforced here, at the only place the XML is produced,
+                // rather than trusted to every upstream that can build a cue.
+                let textContent = plainText.isEmpty ? " " : plainText
 
                 if schemaVersion.supportsTextDirection {
                     xml += """
 
-                        <Text Vposition="\(vpos)" Halign="\(halignStr)" Direction="ltr" Valign="\(valignStr)" Hposition="\(hposStr)">\(plainText)</Text>
+                        <Text Vposition="\(vpos)" Halign="\(halignStr)" Direction="\(textDirection)" Valign="\(valignStr)" Hposition="\(hposStr)">\(textContent)</Text>
                     """
                 } else {
                     xml += """
 
-                        <Text Vposition="\(vpos)" Halign="\(halignStr)" Valign="\(valignStr)">\(plainText)</Text>
+                        <Text Vposition="\(vpos)" Halign="\(halignStr)" Valign="\(valignStr)">\(textContent)</Text>
                     """
                 }
             }
@@ -599,6 +639,43 @@ public struct DCPSMPTEExporter: FormatExporter {
     private static func formatSMPTE428Time(_ tc: Timecode) -> String {
         let (h, m, s, f) = tc.components
         return String(format: "%02d:%02d:%02d:%02d", h, m, s, f)
+    }
+
+    /// ST 428-7 `Direction` for a track: `ltr` or `rtl`.
+    ///
+    /// This was hardcoded to "ltr", which is silently wrong for Arabic and
+    /// Hebrew deliveries — and this app ships Arabic dialect support, so those
+    /// are real customers. An explicit `dcp_text_direction` in ExportOptions
+    /// wins; otherwise it is derived from the track language, defaulting to
+    /// ltr so every existing export is byte-identical.
+    ///
+    /// NOTE the vocabulary is SMPTE's. InterOp's `Direction` attribute means
+    /// something else entirely — horizontal vs vertical writing mode — and is
+    /// deliberately left alone in DCPInterOpFormat.
+    public static func smpteDirection(for language: String, options: ExportOptions?) -> String {
+        if let explicit = options?.extra["dcp_text_direction"]?.lowercased(),
+           explicit == "ltr" || explicit == "rtl" {
+            return explicit
+        }
+        return isRightToLeft(language) ? "rtl" : "ltr"
+    }
+
+    /// Right-to-left by language subtag.
+    ///
+    /// Matched on the PRIMARY subtag so "ar-EG" and the ISO 639-3 dialect tags
+    /// this app uses for Arabic (arq, ary, arz, aeb — the ISDCF registry keys
+    /// dialects by 639-3, not ar-XX) all resolve correctly.
+    public static func isRightToLeft(_ language: String) -> Bool {
+        let primary = language.lowercased()
+            .split(whereSeparator: { $0 == "-" || $0 == "_" })
+            .first.map(String.init) ?? ""
+        let rtl: Set<String> = [
+            "ar", "arq", "ary", "arz", "aeb", "acm", "apc", "ars", "ayl",  // Arabic + dialects
+            "he", "iw",                                                     // Hebrew (iw is legacy)
+            "fa", "prs", "ps",                                              // Persian, Dari, Pashto
+            "ur", "sd", "ug", "yi", "ckb", "dv",                            // Urdu, Sindhi, Uyghur…
+        ]
+        return rtl.contains(primary)
     }
 
     private static func formatSMPTEVAlign(_ pos: VerticalPosition) -> String {
@@ -717,5 +794,247 @@ private enum ISDCFDCNCTableSMPTE {
     ]
     static func bcp47(forDCNCTag tag: String) -> String? {
         map[tag.uppercased()]
+    }
+}
+
+// MARK: - DCP preview geometry (shared with the AlphaDCP player overlay)
+//
+// ST 428-7 (and InterOp CineCanvas) position EACH <Text> element of a
+// <Subtitle> independently, and a DCP player/server draws each line at its
+// own Vposition — it does not stack the cue's lines from a single anchor.
+// These pure types carry that model from the importers (which record it on
+// `TextBlock.verticalPosition` / `.horizontalPosition`) to the preview, so
+// the overlay places lines exactly where a projector maps them. Everything
+// here is a pure function of Core types so the geometry is unit-testable
+// without rendering SwiftUI.
+
+/// One display line of a cue with its position fully resolved: the line's own
+/// position when the block carries one, the cue's otherwise.
+public struct DCPLinePosition: Equatable {
+    public var text: String
+    public var vertical: VerticalPosition
+    public var horizontal: HorizontalPosition
+    public var alignment: TextAlignment
+
+    public init(text: String, vertical: VerticalPosition,
+                horizontal: HorizontalPosition, alignment: TextAlignment) {
+        self.text = text
+        self.vertical = vertical
+        self.horizontal = horizontal
+        self.alignment = alignment
+    }
+}
+
+/// The position a cue falls back to when one of its lines has none of its
+/// own — the cue's custom values when enabled, else the track defaults,
+/// exactly as `Track.effectivePosition(for:)` resolves them.
+public struct DCPResolvedPosition: Equatable {
+    public var vertical: VerticalPosition
+    public var horizontal: HorizontalPosition
+    public var alignment: TextAlignment
+
+    public init(vertical: VerticalPosition, horizontal: HorizontalPosition,
+                alignment: TextAlignment) {
+        self.vertical = vertical
+        self.horizontal = horizontal
+        self.alignment = alignment
+    }
+}
+
+public enum DCPLineResolver {
+    /// Resolve a cue into the display lines a player would draw.
+    ///
+    /// When NO block carries a position of its own, the cue is one block of
+    /// text hung from the cue position — the behaviour every non-DCP format
+    /// and every older document relies on, unchanged. When at least one block
+    /// has its own position (a DCP import), each block becomes its own line at
+    /// its own position, so a two-line cue whose lines sit at Vposition 14 and
+    /// 7 renders exactly there instead of averaged to 10.5.
+    public static func lines(for cue: Subtitle, cuePosition: DCPResolvedPosition) -> [DCPLinePosition] {
+        let blocks = cue.textBlocks
+        guard blocks.contains(where: { $0.verticalPosition != nil || $0.horizontalPosition != nil }) else {
+            return [DCPLinePosition(text: cue.plainText,
+                                    vertical: cuePosition.vertical,
+                                    horizontal: cuePosition.horizontal,
+                                    alignment: cuePosition.alignment)]
+        }
+        return blocks
+            .filter { !$0.plainText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .map { block in
+                DCPLinePosition(text: block.plainText,
+                                vertical: block.verticalPosition ?? cuePosition.vertical,
+                                horizontal: block.horizontalPosition ?? cuePosition.horizontal,
+                                alignment: cuePosition.alignment)
+            }
+    }
+}
+
+/// Pure geometry for the DCP preview overlay: where the picture rect is, how
+/// big the font really is, and where a line hangs vertically.
+public enum DCPOverlayGeometry {
+
+    /// The D-Cinema screen height a subtitle `Font Size` point value is
+    /// relative to: the specs (TI CineCanvas / SMPTE ST 428-7) render the
+    /// picture as an 11-inch screen and a point is 1/72 inch — 11 × 72 = 792.
+    /// Same constant as `ImportedAppearance.dcpScreenHeightPoints` (issue
+    /// #63); repeated here because Formats must not depend on AlphaSubUI.
+    public static let screenHeightPoints: Double = 792
+
+    /// The pixel size a DCP point size occupies on a picture `pictureHeight`
+    /// pixels tall: a 42 pt subtitle covers 42/792 of the picture height here
+    /// exactly as it does on a projector.
+    public static func fontPixelSize(dcpPoints: Double, pictureHeight: CGFloat) -> CGFloat {
+        CGFloat(dcpPoints) * pictureHeight / CGFloat(screenHeightPoints)
+    }
+
+    /// How one line hangs vertically: the anchor edge and the inset from that
+    /// edge as a FRACTION of the picture height. Fractions (not points) keep
+    /// the result comparable across any render size — two lines with equal
+    /// placements land at the same y, whatever the view does.
+    public struct VerticalPlacement: Equatable {
+        public enum Anchor: Equatable { case top, center, bottom }
+        public var anchor: Anchor
+        public var insetFraction: Double
+
+        public init(anchor: Anchor, insetFraction: Double) {
+            self.anchor = anchor
+            self.insetFraction = insetFraction
+        }
+    }
+
+    /// Where a line sits horizontally: which edge it hangs from, and how far.
+    ///
+    /// `HorizontalPosition.percentage` is a position on the SCREEN, left-origin
+    /// — but which part of the TEXT it positions is carried separately, by the
+    /// alignment. `DCPHorizontal.placement` builds the pair that way: a DCP
+    /// cue with `Halign="left" Hposition="5.0"` becomes `.percentage(5)` plus
+    /// `.left`, meaning "the text's left edge at 5 % of the screen".
+    ///
+    /// Reading the percentage without the alignment centres the text on 5 %
+    /// instead, which hangs most of the line off the left of the picture. That
+    /// is what AlphaDCP's overlay did, and the fix is not a nudge: the
+    /// alignment is the half of the pair that says what is being positioned.
+    public struct HorizontalPlacement: Equatable {
+        public enum Anchor: Equatable { case leading, center, trailing }
+        public var anchor: Anchor
+        /// Inset from the anchored edge, as a fraction of the picture width.
+        /// Zero for a centred line.
+        public var insetFraction: Double
+        /// Shift of the line's centre, as a fraction of the picture width.
+        /// Zero unless the anchor is `.center`.
+        public var centreOffsetFraction: Double
+
+        public init(anchor: Anchor, insetFraction: Double = 0,
+                    centreOffsetFraction: Double = 0) {
+            self.anchor = anchor
+            self.insetFraction = insetFraction
+            self.centreOffsetFraction = centreOffsetFraction
+        }
+    }
+
+    public static func horizontalPlacement(_ pos: HorizontalPosition,
+                                           alignment: TextAlignment) -> HorizontalPlacement {
+        switch pos {
+        case .leftAligned:
+            return HorizontalPlacement(anchor: .leading)
+        case .rightAligned:
+            return HorizontalPlacement(anchor: .trailing)
+        case .centered:
+            return HorizontalPlacement(anchor: .center)
+        case .percentage(let raw):
+            let pct = min(max(raw, 0), 100)
+            switch alignment {
+            case .left, .start:
+                return HorizontalPlacement(anchor: .leading, insetFraction: pct / 100)
+            case .right, .end:
+                return HorizontalPlacement(anchor: .trailing,
+                                           insetFraction: (100 - pct) / 100)
+            default:
+                return HorizontalPlacement(anchor: .center,
+                                           centreOffsetFraction: (pct - 50) / 100)
+            }
+        }
+    }
+
+    /// Map a resolved vertical position to an anchor + inset fraction.
+    ///
+    /// `.percentage` is the model convention (0 = top, 100 = bottom of the
+    /// active pixel area). Above 50 the line is bottom-anchored — so a DCP
+    /// cue at 86 % (Vposition 14, Valign bottom) lands bottom-edge-at-86 % as
+    /// a projector shows it; at or below 50 it is top-anchored. The pixel
+    /// constants of SubtitleFrameCompositor are expressed as fractions of its
+    /// 1080-line reference (topSafePadding 20, lineShiftStep 26).
+    public static func verticalPlacement(_ pos: VerticalPosition,
+                                         safeAreaBottomFraction: Double = 0.08) -> VerticalPlacement {
+        switch pos {
+        case .safeArea(.top):
+            return VerticalPlacement(anchor: .top, insetFraction: 20.0 / 1080.0)
+        case .safeArea(.center):
+            return VerticalPlacement(anchor: .center, insetFraction: 0)
+        case .safeArea(.bottom):
+            return VerticalPlacement(anchor: .bottom, insetFraction: safeAreaBottomFraction)
+        case .percentage(let pct):
+            let p = min(max(pct, 0), 100)
+            if p > 50 {
+                return VerticalPlacement(anchor: .bottom, insetFraction: (100 - p) / 100)
+            }
+            return VerticalPlacement(anchor: .top, insetFraction: p / 100)
+        case .row(let row):
+            return VerticalPlacement(anchor: .top, insetFraction: Double(max(0, row - 1)) / 24.0)
+        case .lineShift(let n):
+            let extra = n > 0 ? Double(n) * 26.0 / 1080.0 : 0
+            return VerticalPlacement(anchor: .bottom, insetFraction: safeAreaBottomFraction + extra)
+        }
+    }
+
+    /// The rectangle a projector maps, inside a view of `size`.
+    ///
+    /// Precedence: when the CPL declares MainPictureActiveArea (and the stored
+    /// frame size is known), the active area is aspect-fitted and CENTRED
+    /// inside the aspect-fitted stored frame — that is the rectangle subtitle
+    /// percentages are measured against (a 1998×1080 flat picture in a
+    /// 2048×1080 container leaves 25 px pillarboxes a projector never shows).
+    /// Without it, fall back to the bare display aspect (PAR-corrected), and
+    /// without that, the whole bounds.
+    public static func pictureRect(in size: CGSize,
+                                   storedPictureSize: CGSize? = nil,
+                                   activePictureSize: CGSize? = nil,
+                                   videoAspect: CGFloat? = nil) -> CGRect {
+        let storedRect = aspectFit(size: size, aspect: storedAspect(storedPictureSize: storedPictureSize,
+                                                                    videoAspect: videoAspect))
+        guard let active = activePictureSize, active.width > 1, active.height > 1,
+              let stored = storedPictureSize, stored.width > 1, stored.height > 1
+        else { return storedRect }
+        // The active area is centred in the stored frame (ST 429-16); scale
+        // the stored→view fit down to the active extent.
+        let scale = storedRect.width / stored.width
+        let w = active.width * scale
+        let h = active.height * scale
+        return CGRect(x: storedRect.midX - w / 2, y: storedRect.midY - h / 2,
+                      width: w, height: h)
+    }
+
+    /// Aspect of the stored frame: its pixel dimensions when known (square
+    /// pixels, as every DCI container uses), else the PAR-corrected display
+    /// aspect the host measured.
+    private static func storedAspect(storedPictureSize: CGSize?, videoAspect: CGFloat?) -> CGFloat? {
+        if let stored = storedPictureSize, stored.width > 0, stored.height > 0 {
+            return stored.width / stored.height
+        }
+        return videoAspect
+    }
+
+    /// The letterboxed rect for a PAR-corrected aspect (same aspect-fit the
+    /// display layer's `.resizeAspect` produces); nil aspect = whole bounds.
+    private static func aspectFit(size: CGSize, aspect: CGFloat?) -> CGRect {
+        guard let ar = aspect, ar > 0, size.width > 1, size.height > 1 else {
+            return CGRect(origin: .zero, size: size)
+        }
+        if size.width / size.height > ar {
+            let w = size.height * ar
+            return CGRect(x: (size.width - w) / 2, y: 0, width: w, height: size.height)
+        }
+        let h = size.width / ar
+        return CGRect(x: 0, y: (size.height - h) / 2, width: size.width, height: h)
     }
 }

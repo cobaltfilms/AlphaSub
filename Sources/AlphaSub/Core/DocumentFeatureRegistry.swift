@@ -37,7 +37,7 @@ public enum DocumentCompatibilityError: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .versionTooNew(let version, let supported):
-            return String(localized: "This project requires AlphaSub document version \(version), but this build supports up to version \(supported). Please update AlphaSub to open it.")
+            return String(localized: "This project requires AlphaSUB document version \(version), but this build supports up to version \(supported). Please update AlphaSUB to open it.")
         }
     }
 }

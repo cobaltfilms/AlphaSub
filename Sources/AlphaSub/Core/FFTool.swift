@@ -12,7 +12,7 @@ public enum FFTool {
 
     /// Subdirectory inside the app bundle (or SPM resource bundle) where an
     /// optional bundled ffmpeg/ffprobe lives. See
-    /// `Sources/AlphaSub/App/Resources/ffmpeg/README.md`.
+    /// `Sources/AlphaSubToolBinaries/Resources/ffmpeg/README.md`.
     private static let bundledSubdir = "ffmpeg"
 
     /// Returns the absolute path of a bundled `name` (e.g. "ffmpeg") if one
@@ -24,19 +24,7 @@ public enum FFTool {
     private static func bundledPath(_ name: String) -> String? {
         let fm = FileManager.default
         let rel = "\(bundledSubdir)/\(name)"
-        var candidateRoots: [URL] = []
-        if let r = Bundle.main.resourceURL { candidateRoots.append(r) }
-        candidateRoots.append(Bundle.main.bundleURL)
-        // SPM resource bundle alongside the main bundle.
-        candidateRoots.append(
-            Bundle.main.bundleURL.appendingPathComponent("AlphaSub_AlphaSubApp.bundle")
-        )
-        if let r = Bundle.main.resourceURL {
-            candidateRoots.append(
-                r.appendingPathComponent("AlphaSub_AlphaSubApp.bundle")
-            )
-        }
-        for root in candidateRoots {
+        for root in AppPaths.bundledToolRoots {
             let p = root.appendingPathComponent(rel)
             if fm.isExecutableFile(atPath: p.path) { return p.path }
         }

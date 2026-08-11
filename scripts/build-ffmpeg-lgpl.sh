@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # build-ffmpeg-lgpl.sh — build a minimal, fully-LGPL ffmpeg + ffprobe from
-# source and install them into Sources/AlphaSub/App/Resources/ffmpeg/ for
+# source and install them into Sources/AlphaSubToolBinaries/Resources/ffmpeg/ for
 # bundling. Unlike fetch-ffmpeg.sh (which downloads GPL static builds), this
 # produces binaries AlphaSub can legally redistribute inside the DMG:
 #
@@ -26,7 +26,7 @@ set -euo pipefail
 
 FFMPEG_VERSION="${FFMPEG_VERSION:-7.1}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DEST="$ROOT/Sources/AlphaSub/App/Resources/ffmpeg"
+DEST="$ROOT/Sources/AlphaSubToolBinaries/Resources/ffmpeg"
 WORK="${FFMPEG_WORK_DIR:-$(mktemp -d)}"
 KEEP_WORK="${FFMPEG_WORK_DIR:+1}"
 [ -z "${KEEP_WORK}" ] && trap 'rm -rf "$WORK"' EXIT

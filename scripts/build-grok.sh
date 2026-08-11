@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # build-grok.sh — bundle Grok's `grk_decompress` (JPEG2000, AGPL-3.0) and its
-# full dylib closure into Sources/AlphaSub/App/Resources/grok/, self-contained
+# full dylib closure into Sources/AlphaSubToolBinaries/Resources/grok/, self-contained
 # via @loader_path, for real-time DCP playback without a Homebrew install.
 #
 #   bash scripts/build-grok.sh
@@ -19,7 +19,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DEST="$ROOT/Sources/AlphaSub/App/Resources/grok"
+DEST="$ROOT/Sources/AlphaSubToolBinaries/Resources/grok"
 SRC="$(command -v grk_decompress || echo /opt/homebrew/bin/grk_decompress)"
 
 [ -x "$SRC" ] || { echo "✗ grk_decompress not found — brew install grokj2k" >&2; exit 1; }

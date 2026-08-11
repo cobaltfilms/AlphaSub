@@ -17,4 +17,21 @@ public enum AppPaths {
     public static var ffmpegDirectory: URL {
         applicationSupportDirectory.appendingPathComponent("ffmpeg", isDirectory: true)
     }
+
+    /// Candidate roots to search for bundled command-line tools (asdcp, grok,
+    /// ffmpeg). They ship in the AlphaSubToolBinaries resource bundle; the
+    /// legacy AlphaSubApp bundle name is kept as a fallback so a build staged by
+    /// an older packaging run still resolves.
+    public static var bundledToolRoots: [URL] {
+        var roots: [URL] = []
+        if let r = Bundle.main.resourceURL { roots.append(r) }
+        roots.append(Bundle.main.bundleURL)
+        for name in ["AlphaSub_AlphaSubToolBinaries.bundle", "AlphaSub_AlphaSubApp.bundle"] {
+            roots.append(Bundle.main.bundleURL.appendingPathComponent(name))
+            if let r = Bundle.main.resourceURL {
+                roots.append(r.appendingPathComponent(name))
+            }
+        }
+        return roots
+    }
 }

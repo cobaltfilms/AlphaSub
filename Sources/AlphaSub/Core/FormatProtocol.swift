@@ -272,6 +272,42 @@ public final class FormatRegistry {
         return nil
     }
 
+    /// Every importer that claims a file extension.
+    public func importers(forFileExtension ext: String) -> [any FormatImporter.Type] {
+        let lowered = ext.lowercased()
+        return importerOrder.compactMap { importers[$0] }
+            .filter { $0.fileExtensions.contains(lowered) }
+    }
+
+    /// Pick an importer using both the extension and the bytes.
+    ///
+    /// Extension alone is not enough when several formats share one, and
+    /// `.xml` is claimed by TTML, DCP SMPTE, DCP InterOp and xmeml alike.
+    /// Resolving on extension first meant whichever registered earliest won:
+    /// a DCP subtitle XML — an ST 428-7 `<SubtitleReel>` — was handed to the
+    /// TTML importer, which parsed it as an untitled TTML document and named
+    /// the track "TTML Import", losing its language along the way.
+    ///
+    /// So: when exactly one format claims the extension, trust it (its sniffer
+    /// may be weak — plain text has no signature to find). When several do,
+    /// the bytes decide, because `canImport` reads namespaces and root
+    /// elements. Falling back, in order, to content detection across all
+    /// formats and finally to the first extension claimant.
+    public func importer(forFileExtension ext: String,
+                         data: Data) -> (any FormatImporter.Type)? {
+        let claimants = importers(forFileExtension: ext)
+
+        if claimants.count == 1 { return claimants[0] }
+
+        if claimants.count > 1 {
+            if let byContent = claimants.first(where: { $0.canImport(data) }) {
+                return byContent
+            }
+        }
+
+        return detectFormat(from: data) ?? claimants.first
+    }
+
     public var allImporters: [any FormatImporter.Type] { importerOrder.compactMap { importers[$0] } }
     public var allExporters: [any FormatExporter.Type] { Array(exporters.values) }
 }

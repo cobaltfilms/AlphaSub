@@ -630,14 +630,36 @@ public struct TextBlock: Codable, Equatable {
     /// such key) fully decodable, and the key is omitted when `nil`.
     public var language: LanguageCode?
 
-    public init(segments: [TextSegment], language: LanguageCode? = nil) {
+    /// The line's own vertical position, when the source format positions each
+    /// display line independently — DCP (ST 428-7 and InterOp both) carries
+    /// Vposition/Valign on EVERY <Text> element, and a player draws each line
+    /// at its own position rather than stacking the cue from one anchor.
+    /// `nil` means "this line has no position of its own; use the cue's", the
+    /// case for every non-DCP format and every hand-authored cue. Optional +
+    /// synthesized Codable, exactly like `language`: older projects decode
+    /// cleanly and the key is omitted when `nil`.
+    public var verticalPosition: VerticalPosition?
+
+    /// The line's own horizontal position, companion to `verticalPosition`
+    /// (Hposition/Halign on the <Text> element). `nil` = use the cue's.
+    public var horizontalPosition: HorizontalPosition?
+
+    public init(segments: [TextSegment], language: LanguageCode? = nil,
+                verticalPosition: VerticalPosition? = nil,
+                horizontalPosition: HorizontalPosition? = nil) {
         self.segments = segments
         self.language = language
+        self.verticalPosition = verticalPosition
+        self.horizontalPosition = horizontalPosition
     }
 
-    public init(plainText: String, language: LanguageCode? = nil) {
+    public init(plainText: String, language: LanguageCode? = nil,
+                verticalPosition: VerticalPosition? = nil,
+                horizontalPosition: HorizontalPosition? = nil) {
         self.segments = [TextSegment(text: plainText, style: [])]
         self.language = language
+        self.verticalPosition = verticalPosition
+        self.horizontalPosition = horizontalPosition
     }
 
     public var characterCount: Int {
@@ -1663,5 +1685,22 @@ public struct MediaReference: Codable {
 
     public var displayCodecName: String {
         videoCodec?.shortName ?? "Unknown"
+    }
+}
+
+// A DCP's `editRate` is a rational read off the CPL and need not be one of the
+// rates catalogued here (a 30000/1001 package is legal, just not Bv2.1).
+// Snapping to the nearest catalogued rate is what lets the playback engine and
+// the timecode display work at all; it is a display concern only, and never
+// changes what is written back out.
+//
+// Lives in Core because three places needed it and two of them had already
+// written their own identical copy — one in each application.
+public extension FrameRate {
+    /// Nearest catalogued frame rate to an arbitrary DCP edit rate.
+    static func closest(to value: Double) -> FrameRate {
+        FrameRate.allCases.min {
+            abs($0.value - value) < abs($1.value - value)
+        } ?? .fps24
     }
 }

@@ -104,7 +104,9 @@ public struct DCPInterOpImporter: FormatImporter {
                 let segments = parseInteropTextSegments(textElem,
                                                         baseStyle: inheritedStyle,
                                                         baseColor: inheritedColor)
-                textBlocks.append(TextBlock(segments: segments))
+                textBlocks.append(TextBlock(segments: segments,
+                                            verticalPosition: interopLineVertical(textElem),
+                                            horizontalPosition: interopLineHorizontal(textElem)))
             }
 
             let position = parseInteropPosition(textElems.map(\.elem))
@@ -229,6 +231,41 @@ public struct DCPInterOpImporter: FormatImporter {
         }
 
         return InteropPosition(vertical: vpos, horizontal: hpos, alignment: align, hasCustomPosition: hasCustom)
+    }
+
+    /// The line's own vertical position from its <Text> element, in the model
+    /// convention (`.percentage` 0 = top, 100 = bottom) — same conversion as
+    /// `parseInteropPosition`, applied per element. CineCanvas, like ST 428-7,
+    /// positions every <Text> independently and a player draws each line at
+    /// its own VPosition. nil when the element carries neither attribute, in
+    /// which case the line defers to the cue's position.
+    private static func interopLineVertical(_ textElem: XMLElement) -> VerticalPosition? {
+        let va = textElem.attribute(forName: "VAlign")?.stringValue?.lowercased()
+        let vp = textElem.attribute(forName: "VPosition")?.stringValue.flatMap(Double.init)
+        guard va != nil || vp != nil else { return nil }
+        switch va ?? "bottom" {
+        case "top":
+            return vp.map { .percentage(min(100, max(0, $0))) } ?? .safeArea(.top)
+        case "center":
+            if let vp, vp != 0 {
+                return .percentage(min(100, max(0, 50.0 - vp)))
+            }
+            return .safeArea(.center)
+        default: // bottom
+            if let vp {
+                return .percentage(min(100, max(0, 100.0 - vp)))
+            }
+            return .safeArea(.bottom)
+        }
+    }
+
+    /// The line's own horizontal position from its <Text> element, or nil when
+    /// it carries neither HAlign nor HPosition (defer to the cue's).
+    private static func interopLineHorizontal(_ textElem: XMLElement) -> HorizontalPosition? {
+        let ha = textElem.attribute(forName: "HAlign")?.stringValue?.lowercased()
+        let hp = textElem.attribute(forName: "HPosition")?.stringValue.flatMap(Double.init)
+        guard ha != nil || hp != nil else { return nil }
+        return DCPHorizontal.placement(halign: ha, hposition: hp).0
     }
 
     private static func parseInteropTextSegments(_ textElem: XMLElement,

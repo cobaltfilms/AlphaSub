@@ -2,6 +2,7 @@ import Foundation
 import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
+import AlphaSubCore
 
 // MARK: - Grok JPEG2000 subprocess decoder (open-core)
 //
@@ -30,7 +31,7 @@ public struct GrokDecoder: Sendable {
         public var errorDescription: String? {
             switch self {
             case .grokMissing:
-                return String(localized: "The Grok JPEG2000 decoder (grk_decompress) wasn't found. It ships with AlphaSub; reinstall the latest release, or install it with `brew install grokj2k`.")
+                return String(localized: "The Grok JPEG2000 decoder (grk_decompress) wasn't found. It ships with AlphaSUB; reinstall the latest release, or install it with `brew install grokj2k`.")
             case .decodeFailed(let m):
                 return String(localized: "JPEG2000 decode failed: \(m)")
             case .badOutput:
@@ -85,14 +86,7 @@ public struct GrokDecoder: Sendable {
     private static func bundledPath() -> String? {
         let fm = FileManager.default
         let rel = "grok/grk_decompress"
-        var roots: [URL] = []
-        if let r = Bundle.main.resourceURL { roots.append(r) }
-        roots.append(Bundle.main.bundleURL)
-        roots.append(Bundle.main.bundleURL.appendingPathComponent("AlphaSub_AlphaSubApp.bundle"))
-        if let r = Bundle.main.resourceURL {
-            roots.append(r.appendingPathComponent("AlphaSub_AlphaSubApp.bundle"))
-        }
-        for root in roots {
+        for root in AppPaths.bundledToolRoots {
             let p = root.appendingPathComponent(rel)
             if fm.isExecutableFile(atPath: p.path) { return p.path }
         }
