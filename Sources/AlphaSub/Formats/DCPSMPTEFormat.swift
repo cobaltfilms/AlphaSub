@@ -179,16 +179,16 @@ public struct DCPSMPTEImporter: FormatImporter {
                 // the cue's (nil). The anchor is THIS element's Valign only
                 // (absent = bottom, the spec default) — not whatever a sibling
                 // line declared. Same conversion as the cue-level resolve
-                // below: model percentage is 0 = top, 100 = bottom.
+                // below: model percentage is 0 = bottom, 100 = top.
                 let lineValign = textElem.attribute(forName: "Valign")?.stringValue?.lowercased()
                 let hasOwnV = textElem.attribute(forName: "Vposition")?.stringValue != nil
                     || lineValign != nil
                 if hasOwnV {
                     let pct: Double
                     switch lineValign {
-                    case "top":    pct = vpos
+                    case "top":    pct = 100.0 - vpos
                     case "center": pct = 50.0
-                    default:       pct = 100.0 - vpos
+                    default:       pct = vpos
                     }
                     blockVertical = .percentage(max(0.0, min(100.0, pct)))
                 }
@@ -204,25 +204,26 @@ public struct DCPSMPTEImporter: FormatImporter {
             // Resolve vertical position:
             // - If an explicit Valign was provided, combine it with the average
             //   Vposition numeric to produce a precise percentage (our model:
-            //   0 = top, 100 = bottom). SMPTE Vposition is the offset from the
-            //   Valign anchor: Valign=bottom, Vposition=14 → 14% from bottom →
-            //   86% from top → .percentage(86).
+            //   0 = bottom, 100 = top). SMPTE Vposition is the offset from the
+            //   Valign anchor: Valign=bottom, Vposition=14 → 14% up from the
+            //   bottom → .percentage(14) — no conversion; a top anchor counts
+            //   down from the top and is complemented.
             // - If no Valign, fall back to the legacy heuristic (avgVpos>10 →
             //   percentage, else safeArea(.bottom)).
             let avgVpos = vposCount > 0 ? vposSum / vposCount : 8.0
             if let valign = explicitValign {
                 let pct: Double
                 switch valign {
-                case .top:    pct = avgVpos
+                case .top:    pct = max(0.0, min(100.0, 100.0 - avgVpos))
                 case .center: pct = 50.0
-                case .bottom: pct = max(0.0, min(100.0, 100.0 - avgVpos))
+                case .bottom: pct = max(0.0, min(100.0, avgVpos))
                 }
                 parsedVertical = .percentage(pct)
             } else if hasPositionData {
                 // Has Hposition/Halign but no Valign — use safeArea default.
                 parsedVertical = .safeArea(.bottom)
             } else if avgVpos > 10.0 {
-                parsedVertical = .percentage(100.0 - avgVpos)
+                parsedVertical = .percentage(avgVpos)
             } else {
                 parsedVertical = .safeArea(.bottom)
             }
@@ -490,12 +491,12 @@ public struct DCPSMPTEExporter: FormatExporter {
         // Base V position (the baseline line for safeArea-bottom stacking,
         // measured as % up from the bottom edge): prefer the explicit export
         // option, then the track's default vertical position (set via the
-        // DCP Subtitle Settings sheet — stored as .percentage with 0=top,
-        // 100=bottom, so convert to "up from bottom" = 100 - pct), then 8.0.
+        // DCP Subtitle Settings sheet — stored as .percentage with 0=bottom,
+        // 100=top, the same convention), then 8.0.
         let baseVPosition: Double = {
             if let v = opts.vPosition { return v }
             if case .percentage(let pct) = track.defaultVerticalPosition {
-                return max(0.0, min(100.0, 100.0 - pct))
+                return max(0.0, min(100.0, pct))
             }
             return 8.0
         }()
@@ -689,11 +690,13 @@ public struct DCPSMPTEExporter: FormatExporter {
     private static func formatDCPVPosition(_ pos: VerticalPosition, blockIndex: Int, totalBlocks: Int, baseVPosition: Double = 8.0, lineHeight: Double = 7.0) -> String {
         switch pos {
         case .percentage(let pct):
-            // Our model: 0 = top, 100 = bottom. SMPTE 428-7: 1 = bottom, 100 = top (inverted).
+            // Our model: 0 = bottom, 100 = top. SMPTE 428-7 with Valign=bottom
+            // counts up from the bottom edge — the same convention, so the
+            // percentage exports verbatim (clamped to [1, 100]).
             // The stored percentage is the BASELINE (bottom-most) line; earlier
             // blocks stack upward by `lineHeight` so a multi-line custom-positioned
             // cue renders like a regular bottom-anchored cue (top line higher).
-            let base = 100.0 - pct
+            let base = pct
             let vpos = base + Double(totalBlocks - 1 - blockIndex) * lineHeight
             return String(format: "%.1f", max(1.0, min(100.0, vpos)))
         case .row(let r):
@@ -958,12 +961,13 @@ public enum DCPOverlayGeometry {
 
     /// Map a resolved vertical position to an anchor + inset fraction.
     ///
-    /// `.percentage` is the model convention (0 = top, 100 = bottom of the
-    /// active pixel area). Above 50 the line is bottom-anchored — so a DCP
-    /// cue at 86 % (Vposition 14, Valign bottom) lands bottom-edge-at-86 % as
-    /// a projector shows it; at or below 50 it is top-anchored. The pixel
-    /// constants of SubtitleFrameCompositor are expressed as fractions of its
-    /// 1080-line reference (topSafePadding 20, lineShiftStep 26).
+    /// `.percentage` is the model convention (0 = bottom, 100 = top of the
+    /// active pixel area — the DCP `Vposition` with `Valign="bottom"`). At or
+    /// below 50 the line is bottom-anchored — so a DCP cue at 14 % (Vposition
+    /// 14, Valign bottom) lands bottom-edge-at-14 % as a projector shows it;
+    /// above 50 it is top-anchored. The pixel constants of
+    /// SubtitleFrameCompositor are expressed as fractions of its 1080-line
+    /// reference (topSafePadding 20, lineShiftStep 26).
     public static func verticalPlacement(_ pos: VerticalPosition,
                                          safeAreaBottomFraction: Double = 0.08) -> VerticalPlacement {
         switch pos {
@@ -976,9 +980,9 @@ public enum DCPOverlayGeometry {
         case .percentage(let pct):
             let p = min(max(pct, 0), 100)
             if p > 50 {
-                return VerticalPlacement(anchor: .bottom, insetFraction: (100 - p) / 100)
+                return VerticalPlacement(anchor: .top, insetFraction: (100 - p) / 100)
             }
-            return VerticalPlacement(anchor: .top, insetFraction: p / 100)
+            return VerticalPlacement(anchor: .bottom, insetFraction: p / 100)
         case .row(let row):
             return VerticalPlacement(anchor: .top, insetFraction: Double(max(0, row - 1)) / 24.0)
         case .lineShift(let n):

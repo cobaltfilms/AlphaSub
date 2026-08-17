@@ -863,7 +863,7 @@ public struct TextStyle: Codable, OptionSet, Equatable {
 public enum VerticalPosition: Codable, Equatable {
     case row(Int)                   // Teletext row 1-23
     case lineShift(Int)            // Lines shifted from safe area
-    case percentage(Double)        // 0-100 percent from top of active pixel area (DCP/TTML/InterOp standard)
+    case percentage(Double)        // 0-100 percent up from the BOTTOM of the active pixel area (DCP/SMPTE convention: Vposition with Valign=bottom)
     case safeArea(SafeAreaPosition)
 
     public static let bottom: VerticalPosition = .safeArea(.bottom)
@@ -1317,6 +1317,37 @@ public struct SubtitleDocument: Codable {
             for i in tracks.indices {
                 if tracks[i].subtitles.isEmpty && tracks[i].frameRate == nil {
                     tracks[i].frameRate = legacyFR
+                }
+            }
+        }
+        // Migration: version-1 projects stored `VerticalPosition.percentage`
+        // measured DOWN FROM THE TOP of the active pixel area; version 2
+        // measures UP FROM THE BOTTOM (the DCP/SMPTE convention). Flip every
+        // stored percentage so an old project renders exactly where it did.
+        // Anchor-based cases (safeArea/row/lineShift) are unaffected.
+        if version < 2 {
+            migrateTopOriginVerticalPositions()
+        }
+    }
+
+    /// Version 1 → 2: complement every top-origin vertical percentage
+    /// (cue, per-line block, and track default) to the bottom-origin
+    /// convention. See `DocumentFeature.bottomOriginVerticalPosition`.
+    private mutating func migrateTopOriginVerticalPositions() {
+        func flipped(_ pos: VerticalPosition) -> VerticalPosition {
+            if case .percentage(let p) = pos { return .percentage(100.0 - p) }
+            return pos
+        }
+        for t in tracks.indices {
+            if let raw = tracks[t].metadata["track_default_vpos_pct"], let v = Double(raw) {
+                tracks[t].metadata["track_default_vpos_pct"] = String(format: "%.1f", 100.0 - v)
+            }
+            for s in tracks[t].subtitles.indices {
+                tracks[t].subtitles[s].verticalPosition = flipped(tracks[t].subtitles[s].verticalPosition)
+                for b in tracks[t].subtitles[s].textBlocks.indices {
+                    if let blockV = tracks[t].subtitles[s].textBlocks[b].verticalPosition {
+                        tracks[t].subtitles[s].textBlocks[b].verticalPosition = flipped(blockV)
+                    }
                 }
             }
         }

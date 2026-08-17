@@ -207,16 +207,16 @@ public struct DCPInterOpImporter: FormatImporter {
 
             switch va {
             case "top":
-                vpos = vp.map { .percentage(min(100, max(0, $0))) } ?? .safeArea(.top)
+                vpos = vp.map { .percentage(min(100, max(0, 100.0 - $0))) } ?? .safeArea(.top)
             case "center":
                 if let vp, vp != 0 {
-                    vpos = .percentage(min(100, max(0, 50.0 - vp)))
+                    vpos = .percentage(min(100, max(0, 50.0 + vp)))
                 } else {
                     vpos = .safeArea(.center)
                 }
             default: // bottom
                 if let vp {
-                    vpos = .percentage(min(100, max(0, 100.0 - vp)))
+                    vpos = .percentage(min(100, max(0, vp)))
                 }
             }
 
@@ -234,7 +234,7 @@ public struct DCPInterOpImporter: FormatImporter {
     }
 
     /// The line's own vertical position from its <Text> element, in the model
-    /// convention (`.percentage` 0 = top, 100 = bottom) — same conversion as
+    /// convention (`.percentage` 0 = bottom, 100 = top) — same conversion as
     /// `parseInteropPosition`, applied per element. CineCanvas, like ST 428-7,
     /// positions every <Text> independently and a player draws each line at
     /// its own VPosition. nil when the element carries neither attribute, in
@@ -245,15 +245,15 @@ public struct DCPInterOpImporter: FormatImporter {
         guard va != nil || vp != nil else { return nil }
         switch va ?? "bottom" {
         case "top":
-            return vp.map { .percentage(min(100, max(0, $0))) } ?? .safeArea(.top)
+            return vp.map { .percentage(min(100, max(0, 100.0 - $0))) } ?? .safeArea(.top)
         case "center":
             if let vp, vp != 0 {
-                return .percentage(min(100, max(0, 50.0 - vp)))
+                return .percentage(min(100, max(0, 50.0 + vp)))
             }
             return .safeArea(.center)
         default: // bottom
             if let vp {
-                return .percentage(min(100, max(0, 100.0 - vp)))
+                return .percentage(min(100, max(0, vp)))
             }
             return .safeArea(.bottom)
         }
@@ -451,7 +451,7 @@ public struct DCPInterOpExporter: FormatExporter {
         let baseVPosition: Double = {
             if let v = opts.vPosition { return v }
             if case .percentage(let pct) = track.defaultVerticalPosition {
-                return max(0.0, min(100.0, 100.0 - pct))
+                return max(0.0, min(100.0, pct))
             }
             return 8.0
         }()
@@ -570,12 +570,12 @@ public struct DCPInterOpExporter: FormatExporter {
     private static func formatInteropVPosition(_ pos: VerticalPosition, blockIndex: Int, totalBlocks: Int, baseVPosition: Double = 8.0, lineHeight: Double = 7.0) -> String {
         switch pos {
         case .percentage(let pct):
-            // Our model: 0 = top, 100 = bottom; anchored bottom ⇒ distance up
-            // from the bottom edge. The stored percentage is the BASELINE
-            // (bottom-most) line; earlier blocks stack upward by `lineHeight`
-            // so a multi-line custom-positioned cue renders like a regular
-            // bottom-anchored cue (top line higher).
-            let base = 100.0 - pct
+            // Our model: 0 = bottom, 100 = top — the same convention as a
+            // bottom-anchored VPosition, so the percentage exports verbatim.
+            // The stored percentage is the BASELINE (bottom-most) line; earlier
+            // blocks stack upward by `lineHeight` so a multi-line custom-positioned
+            // cue renders like a regular bottom-anchored cue (top line higher).
+            let base = pct
             let vpos = base + Double(totalBlocks - 1 - blockIndex) * lineHeight
             return String(format: "%.1f", max(0.0, min(100.0, vpos)))
         case .safeArea(.center):

@@ -202,9 +202,11 @@ public struct ASSImporter: FormatImporter {
             default: align = .center
             }
             if parts.count > 5, let marginV = Int(parts[7]), marginV > 0 {
+                // ASS MarginV is the distance from the anchored edge; the
+                // model percentage counts up from the bottom.
                 switch vpos {
-                case .safeArea(.bottom): vpos = .percentage(Double(100 - marginV))
-                case .safeArea(.top): vpos = .percentage(Double(marginV))
+                case .safeArea(.bottom): vpos = .percentage(Double(marginV))
+                case .safeArea(.top): vpos = .percentage(Double(100 - marginV))
                 default: break
                 }
             }
@@ -456,7 +458,9 @@ public struct ASSExporter: FormatExporter {
             var overrides = ""
             switch sub.verticalPosition {
             case .percentage(let pct):
-                overrides += "\\pos(\(playResX/2),\(Int(Double(playResY) * pct / 100.0)))"
+                // \pos y counts down from the top of PlayRes; the model
+                // percentage counts up from the bottom — complement.
+                overrides += "\\pos(\(playResX/2),\(Int(Double(playResY) * (100.0 - pct) / 100.0)))"
             case .safeArea(.top):
                 overrides += "\\an8"
             case .safeArea(.center):

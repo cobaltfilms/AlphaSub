@@ -415,8 +415,10 @@ public struct TTMLImporter: FormatImporter {
             ?? pElem.attribute(forLocalName: "origin", uri: ttsNS)?.stringValue {
             let parts = origin.split(separator: " ").map { String($0).trimmingCharacters(in: .whitespaces) }
             if parts.count >= 2 {
+                // TTML origin y counts DOWN from the top; the model percentage
+                // counts UP from the bottom — complement.
                 if let yPct = parsePercentage(parts[1]) {
-                    vpos = .percentage(yPct)
+                    vpos = .percentage(min(100, max(0, 100.0 - yPct)))
                 }
             }
         }
@@ -696,8 +698,8 @@ public struct TTMLExporter: FormatExporter {
     }
 
     /// Build a `tts:origin` string from the subtitle's vertical/horizontal position
-    /// as a percentage of the active pixel area. Our model uses 0=top, 0=left, 0–100.
-    /// TTML uses the same convention.
+    /// as a percentage of the active pixel area. Our model uses 0=bottom, 0=left,
+    /// 0–100; TTML origin y counts down from the top, so V is complemented.
     static func formatTTMLOrigin(vertical: VerticalPosition, horizontal: HorizontalPosition) -> String {
         let h = horizontalPercent(horizontal)
         let v = verticalPercent(vertical)
@@ -713,12 +715,14 @@ public struct TTMLExporter: FormatExporter {
         }
     }
 
+    /// TTML origin y, percent DOWN from the top (the model stores percent UP
+    /// from the bottom, so `.percentage` is complemented here).
     static func verticalPercent(_ pos: VerticalPosition) -> Double {
         switch pos {
         case .safeArea(.top):    return 0.0
         case .safeArea(.center): return 50.0
         case .safeArea(.bottom): return 85.0  // near bottom (matches "bottom" region origin)
-        case .percentage(let v):  return v
+        case .percentage(let v):  return min(100.0, max(0.0, 100.0 - v))
         case .row, .lineShift:   return 85.0
         }
     }

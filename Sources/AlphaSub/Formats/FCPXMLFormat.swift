@@ -508,7 +508,7 @@ public struct FCPXMLExporter: FormatExporter {
         case .safeArea(.center):  return 0
         case .row(let r):         return r <= 11 ? topY : bottomY
         case .lineShift:          return bottomY
-        case .percentage(let p):  return Int((50.0 - p) / 50.0 * Double(topY))
+        case .percentage(let p):  return Int((p - 50.0) / 50.0 * Double(topY))
         }
     }
 

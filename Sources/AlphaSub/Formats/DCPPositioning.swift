@@ -96,11 +96,10 @@ public enum DCPHorizontal {
 
 /// Shared vertical placement between AlphaSub's model and the DCP dialects.
 ///
-/// AlphaSub stores vertical position as "percent down from the top"; both DCP
-/// formats write `Valign` plus a `Vposition` measured *from that anchor*. The
-/// two read nothing like each other, which is why the app's percentages looked
-/// unrelated to the numbers in the XML (#50). The editor uses this to show the
-/// exact pair a cue will export as, next to the percentage it edits.
+/// AlphaSub stores vertical position as "percent up from the bottom" — the
+/// same convention both DCP formats write as `Valign="bottom"` plus a
+/// `Vposition` measured up from the bottom edge, so a stored percentage
+/// exports verbatim.
 public enum DCPVertical {
     public static func attributes(vertical: VerticalPosition,
                                   baseVPosition: Double = 8.0) -> (valign: String, vposition: Double) {
@@ -109,9 +108,9 @@ public enum DCPVertical {
         case .safeArea(.center): return ("center", 50.0)
         case .safeArea(.bottom): return ("bottom", baseVPosition)
         case .percentage(let pct):
-            // Model 0 = top; DCP bottom-anchored Vposition counts up from the
-            // bottom edge, so the two are complements.
-            return ("bottom", max(1.0, min(100.0, 100.0 - pct)))
+            // Model 0 = bottom; DCP bottom-anchored Vposition counts up from
+            // the bottom edge — same convention, no conversion.
+            return ("bottom", max(1.0, min(100.0, pct)))
         case .row(let r):        return ("top", Double(r))
         case .lineShift:         return ("bottom", baseVPosition)
         }

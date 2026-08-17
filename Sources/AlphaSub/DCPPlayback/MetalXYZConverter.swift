@@ -1,8 +1,9 @@
 import Foundation
 import Metal
 import CoreVideo
+import AlphaSubColor
 
-// MARK: - GPU X'Y'Z' → Rec.709 conversion (open-core)
+// MARK: - GPU X'Y'Z' → display RGB conversion (open-core)
 //
 // The colour conversion is embarrassingly parallel, so it belongs on the GPU:
 // this Metal compute kernel reads Grok's planar 16-bit X'Y'Z' straight into an
@@ -10,9 +11,10 @@ import CoreVideo
 // with no CPU copy. Frees the CPU cores for decoding. Falls back to the CPU
 // `XYZColorConverter` when Metal is unavailable (returns nil).
 //
-// Same maths as the CPU path (calibrated to the SilenceOfWaves DSM): DCDM
-// gamma-2.6 decode with 52.37/48 scaling → XYZ(D65)→Rec.709 matrix → gamma-2.4
-// encode.
+// The kernel is generic over the target space: the matrix, both transfer
+// curves and the output range arrive as a `ColorKernelParameters` uniform
+// derived from the very same `ColorTransform` the CPU path uses. That is what
+// keeps the two paths in agreement — neither holds its own copy of the maths.
 
 final class MetalXYZConverter: @unchecked Sendable {
 
@@ -32,27 +34,57 @@ final class MetalXYZConverter: @unchecked Sendable {
     private var poolW = 0, poolH = 0
     private var conversionsSinceFlush = 0
 
+    /// Mirrors `ColorKernelParameters` field for field — all 4-byte scalars in
+    /// declaration order, so the Swift struct copies straight across.
     private static let kernelSource = """
     #include <metal_stdlib>
     using namespace metal;
-    kernel void xyz_to_rec709(device const ushort*           planar [[buffer(0)]],
-                              constant uint2&                 dims   [[buffer(1)]],
-                              texture2d<half, access::write>  out    [[texture(0)]],
-                              uint2 gid [[thread_position_in_grid]]) {
+
+    struct ColorParams {
+        float m0, m1, m2, m3, m4, m5, m6, m7, m8;
+        float sourceMaximum;
+        float sourceScale;
+        float sourceGamma;
+        float targetGamma;
+        float targetScale;
+        float rangeLow;
+        float rangeSpan;
+        uint  transferKind;
+    };
+
+    static inline float encode_transfer(float l, constant ColorParams& p) {
+        switch (p.transferKind) {
+            case 1:  // sRGB piecewise
+                return l <= 0.0031308f ? 12.92f * l : 1.055f * pow(l, 1.0f/2.4f) - 0.055f;
+            case 2:  // BT.709 OETF
+                return l < 0.018f ? 4.5f * l : 1.099f * pow(l, 0.45f) - 0.099f;
+            case 3:  // linear
+                return l;
+            default: // pure power law
+                return pow(l / p.targetScale, 1.0f / p.targetGamma);
+        }
+    }
+
+    kernel void xyz_to_display(device const ushort*           planar [[buffer(0)]],
+                               constant uint2&                 dims   [[buffer(1)]],
+                               constant ColorParams&           p      [[buffer(2)]],
+                               texture2d<half, access::write>  out    [[texture(0)]],
+                               uint2 gid [[thread_position_in_grid]]) {
         uint w = dims.x, h = dims.y;
         if (gid.x >= w || gid.y >= h) return;
         uint plane = w * h;
         uint i = gid.y * w + gid.x;
-        const float s = 52.37 / 48.0;
-        float X = s * pow(float(planar[i])           / 4095.0, 2.6);
-        float Y = s * pow(float(planar[plane + i])   / 4095.0, 2.6);
-        float Z = s * pow(float(planar[2*plane + i]) / 4095.0, 2.6);
-        float r =  3.2406*X - 1.5372*Y - 0.4986*Z;
-        float g = -0.9689*X + 1.8758*Y + 0.0415*Z;
-        float b =  0.0557*X - 0.2040*Y + 1.0570*Z;
-        r = clamp(r, 0.0, 1.0); g = clamp(g, 0.0, 1.0); b = clamp(b, 0.0, 1.0);
-        half4 rgba = half4(half(pow(r, 1.0/2.4)), half(pow(g, 1.0/2.4)), half(pow(b, 1.0/2.4)), 1.0h);
-        out.write(rgba, gid);
+        float X = p.sourceScale * pow(float(planar[i])           / p.sourceMaximum, p.sourceGamma);
+        float Y = p.sourceScale * pow(float(planar[plane + i])   / p.sourceMaximum, p.sourceGamma);
+        float Z = p.sourceScale * pow(float(planar[2*plane + i]) / p.sourceMaximum, p.sourceGamma);
+        float r = p.m0*X + p.m1*Y + p.m2*Z;
+        float g = p.m3*X + p.m4*Y + p.m5*Z;
+        float b = p.m6*X + p.m7*Y + p.m8*Z;
+        r = clamp(r, 0.0f, 1.0f); g = clamp(g, 0.0f, 1.0f); b = clamp(b, 0.0f, 1.0f);
+        r = p.rangeLow + p.rangeSpan * encode_transfer(r, p);
+        g = p.rangeLow + p.rangeSpan * encode_transfer(g, p);
+        b = p.rangeLow + p.rangeSpan * encode_transfer(b, p);
+        out.write(half4(half(r), half(g), half(b), 1.0h), gid);
     }
     """
 
@@ -61,7 +93,7 @@ final class MetalXYZConverter: @unchecked Sendable {
               let queue = device.makeCommandQueue() else { return nil }
         do {
             let library = try device.makeLibrary(source: Self.kernelSource, options: nil)
-            guard let fn = library.makeFunction(name: "xyz_to_rec709") else { return nil }
+            guard let fn = library.makeFunction(name: "xyz_to_display") else { return nil }
             self.pipeline = try device.makeComputePipelineState(function: fn)
         } catch { return nil }
         var cache: CVMetalTextureCache?
@@ -73,11 +105,40 @@ final class MetalXYZConverter: @unchecked Sendable {
     }
 
     /// Converts a decoded X'Y'Z' frame to a BGRA8 CVPixelBuffer on the GPU.
-    /// Returns nil on any failure so the caller can fall back to the CPU path.
-    func pixelBuffer(from frame: GrokDecoder.DecodedFrame) -> CVPixelBuffer? {
+    /// Returns nil on any failure so the caller can fall back to the CPU path
+    /// — including a transform the kernel cannot express (a piecewise source
+    /// curve), which the CPU pipeline handles fine.
+    func pixelBuffer(from frame: GrokDecoder.DecodedFrame,
+                     target: ColorSpace = .rec709,
+                     adaptation: ChromaticAdaptation = .bradford,
+                     range: ColorRange = .full) -> CVPixelBuffer? {
+        let transform = ColorTransform(from: .dcdmXYZ, to: target, adaptation: adaptation)
+        guard let parameters = transform.kernelParameters(targetRange: range) else { return nil }
+        return pixelBuffer(from: frame, parameters: parameters, target: target)
+    }
+
+    func pixelBuffer(from frame: GrokDecoder.DecodedFrame,
+                     parameters: ColorKernelParameters,
+                     target: ColorSpace) -> CVPixelBuffer? {
         let info = frame.info
         guard info.componentCount == 3, info.precision <= 16 else { return nil }
-        let w = info.width, h = info.height
+        return pixelBuffer(planar: frame.planarData,
+                           width: info.width, height: info.height,
+                           parameters: parameters, target: target)
+    }
+
+    /// The geometry-only entry point: three contiguous 16-bit planes, no
+    /// codestream in sight. Exists so the GPU path can be tested against the
+    /// CPU pipeline on a synthetic frame — a real DCP is not always around,
+    /// and "GPU matches CPU" is the invariant that keeps the two in step.
+    func pixelBuffer(planar: Data,
+                     width w: Int,
+                     height h: Int,
+                     parameters: ColorKernelParameters,
+                     target: ColorSpace) -> CVPixelBuffer? {
+        guard w > 0, h > 0,
+              planar.count >= 3 * w * h * MemoryLayout<UInt16>.size else { return nil }
+        let frame = planar
 
         // Shared-state section: pool + texture cache only.
         //
@@ -107,7 +168,7 @@ final class MetalXYZConverter: @unchecked Sendable {
         // rather than hand Metal an invalid buffer — a few hundred µs beats a
         // nil buffer that silently demotes the whole conversion to the CPU.
         return withExtendedLifetime(cvTexture) {
-        return frame.planarData.withUnsafeBytes { raw -> CVPixelBuffer? in
+        return frame.withUnsafeBytes { raw -> CVPixelBuffer? in
             guard let base = raw.baseAddress, raw.count > 0 else { return nil }
             let page = Int(getpagesize())
             let canAlias = Int(bitPattern: base) % page == 0 && raw.count % page == 0
@@ -121,9 +182,11 @@ final class MetalXYZConverter: @unchecked Sendable {
                   let enc = cmd.makeComputeCommandEncoder() else { return nil }
 
             var dims = SIMD2<UInt32>(UInt32(w), UInt32(h))
+            var params = parameters
             enc.setComputePipelineState(pipeline)
             enc.setBuffer(inBuffer, offset: 0, index: 0)
             enc.setBytes(&dims, length: MemoryLayout<SIMD2<UInt32>>.stride, index: 1)
+            enc.setBytes(&params, length: MemoryLayout<ColorKernelParameters>.stride, index: 2)
             enc.setTexture(outTexture, index: 0)
             let tw = pipeline.threadExecutionWidth
             let th = max(1, pipeline.maxTotalThreadsPerThreadgroup / tw)
@@ -134,6 +197,7 @@ final class MetalXYZConverter: @unchecked Sendable {
             cmd.commit()
             cmd.waitUntilCompleted()
             guard cmd.status == .completed else { return nil }
+            target.tag(pixelBuffer)
             return pixelBuffer
         }
         }

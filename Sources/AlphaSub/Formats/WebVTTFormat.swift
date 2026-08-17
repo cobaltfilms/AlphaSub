@@ -234,10 +234,12 @@ public struct WebVTTImporter: FormatImporter {
                 let value = String(token.dropFirst("line:".count))
                 if value.contains("%"), let val = Double(value.split(separator: "%").first.map(String.init) ?? ""),
                    val >= 0, val <= 100 {
-                    // Our own exporter writes the default bottom row as
-                    // line:94.0% — treat the bottom band as the safe-area
-                    // default so round-tripped files don't flag every cue.
-                    placement.vertical = val >= 93.5 ? .safeArea(.bottom) : .percentage(val)
+                    // WebVTT line:% counts DOWN from the top; the model counts
+                    // UP from the bottom — complement. Our own exporter writes
+                    // the default bottom row as line:94.0% — treat the bottom
+                    // band as the safe-area default so round-tripped files
+                    // don't flag every cue.
+                    placement.vertical = val >= 93.5 ? .safeArea(.bottom) : .percentage(100.0 - val)
                 }
             } else if token.hasPrefix("position:") {
                 let value = String(token.dropFirst("position:".count))
@@ -268,7 +270,9 @@ public struct WebVTTImporter: FormatImporter {
                 if line.contains("line:") {
                     if let val = extractPercentValue(line, key: "line:") {
                         if val > 5.0 {
-                            position = .percentage(val)
+                            // WebVTT line:% is top-origin; the model is
+                            // bottom-origin — complement.
+                            position = .percentage(100.0 - val)
                         }
                     }
                 }
@@ -503,12 +507,13 @@ public struct WebVTTExporter: FormatExporter {
     }
 
     /// Vertical position as a WebVTT line percentage (0 = top, ~94 = bottom).
+    /// The model percentage counts up from the bottom, so it is complemented.
     private static func vttLinePercent(_ sub: Subtitle) -> Double {
         switch sub.verticalPosition {
         case .safeArea(.top):     return 10.0
         case .safeArea(.center):  return 50.0
         case .safeArea(.bottom):  return 94.0
-        case .percentage(let p):  return min(100.0, max(0.0, p))
+        case .percentage(let p):  return min(100.0, max(0.0, 100.0 - p))
         case .lineShift(let n):   return max(0.0, 94.0 - Double(n) * 6.0)
         case .row(let r):         return min(94.0, Double(r) * 4.0)
         }

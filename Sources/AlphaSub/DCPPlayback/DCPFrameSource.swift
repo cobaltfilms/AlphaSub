@@ -1,5 +1,6 @@
 import Foundation
 import CoreVideo
+import AlphaSubColor
 
 // MARK: - Multi-reel global↔local frame mapping (pure, testable)
 //
@@ -100,7 +101,11 @@ public actor DCPFrameSource {
     private var segments: [Segment] = []
     private var map: ReelSegmentMap = ReelSegmentMap(counts: [])
     private let decoder: GrokDecoder
-    private let converter = XYZColorConverter()
+    private let converter: XYZColorConverter
+    /// Display space frames are converted into, and the GPU form of that same
+    /// transform so the Metal path cannot drift from the CPU one.
+    public let colorTarget: ColorSpace
+    private let kernelParameters: ColorKernelParameters?
     private let capacity: Int
 
     private var cache: [Int: DisplayFrame] = [:]
@@ -116,11 +121,14 @@ public actor DCPFrameSource {
                 decoder: GrokDecoder = GrokDecoder(),
                 reduceLevel: Int? = nil,
                 cacheCapacity: Int = 64,
-                maxConcurrentDecodes: Int = DCPFrameSource.defaultConcurrency) throws {
+                maxConcurrentDecodes: Int = DCPFrameSource.defaultConcurrency,
+                colorTarget: ColorSpace = .rec709,
+                colorAdaptation: ChromaticAdaptation = .bradford) throws {
         let reader = try MXFPictureReader(url: pictureURL, pictureKey: pictureKey)
         try self.init(segments: [(reader, pictureKey)], decoder: decoder,
                       reduceLevel: reduceLevel, cacheCapacity: cacheCapacity,
-                      maxConcurrentDecodes: maxConcurrentDecodes)
+                      maxConcurrentDecodes: maxConcurrentDecodes,
+                      colorTarget: colorTarget, colorAdaptation: colorAdaptation)
     }
 
     /// Multi-reel init: one (reader, key) pair per reel that has a picture
@@ -131,7 +139,9 @@ public actor DCPFrameSource {
                 decoder: GrokDecoder = GrokDecoder(),
                 reduceLevel: Int? = nil,
                 cacheCapacity: Int = 64,
-                maxConcurrentDecodes: Int = DCPFrameSource.defaultConcurrency) throws {
+                maxConcurrentDecodes: Int = DCPFrameSource.defaultConcurrency,
+                colorTarget: ColorSpace = .rec709,
+                colorAdaptation: ChromaticAdaptation = .bradford) throws {
         guard !segments.isEmpty else {
             throw MXFPictureReader.ReaderError.noPictureFrames
         }
@@ -139,6 +149,10 @@ public actor DCPFrameSource {
         self.decoder = decoder
         self.capacity = max(4, cacheCapacity)
         self.gate = DecodeGate(limit: concurrency)
+        self.colorTarget = colorTarget
+        self.converter = XYZColorConverter(target: colorTarget, adaptation: colorAdaptation)
+        self.kernelParameters = ColorTransform(from: .dcdmXYZ, to: colorTarget,
+                                               adaptation: colorAdaptation).kernelParameters()
 
         var built: [Segment] = []
         var globalOffset = 0
@@ -245,6 +259,8 @@ public actor DCPFrameSource {
         }
         let decoder = self.decoder            // Sendable struct
         let converter = self.converter        // Sendable struct
+        let target = self.colorTarget
+        let parameters = self.kernelParameters
         let gate = self.gate                  // actor
         let reduce = self.reduceLevel
         let id = UUID()
@@ -264,7 +280,8 @@ public actor DCPFrameSource {
             let decoded = try decoder.decodeToPlanar(codestream, reduce: reduce)
             // Favour the GPU for the colour conversion; fall back to CPU.
             let pb: CVPixelBuffer
-            if let gpu = MetalXYZConverter.shared, let g = gpu.pixelBuffer(from: decoded) {
+            if let gpu = MetalXYZConverter.shared, let parameters,
+               let g = gpu.pixelBuffer(from: decoded, parameters: parameters, target: target) {
                 pb = g
             } else {
                 pb = try converter.pixelBuffer(from: decoded)
