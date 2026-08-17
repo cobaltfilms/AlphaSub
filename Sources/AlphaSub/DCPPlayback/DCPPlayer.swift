@@ -94,6 +94,22 @@ public final class DCPPlayer: ObservableObject {
         loop?.onFrame = hook
     }
 
+    /// Change how the picture is converted while it is on screen.
+    ///
+    /// The source drops its cache, so the very next frame the loop asks for is
+    /// decoded under the new treatment; `showCurrentFrame` then forces that
+    /// frame out even when the transport is parked, which is the case an
+    /// operator is actually in when they open Preferences and change a colour
+    /// setting. Without the nudge a paused picture keeps showing the old look
+    /// until something else moves the playhead.
+    public func setColorTreatment(_ treatment: DCPFrameSource.ColorTreatment) {
+        let source = self.source
+        Task { [weak self] in
+            await source.setColorTreatment(treatment)
+            await MainActor.run { self?.loop?.showCurrentFrame() }
+        }
+    }
+
     private func ensureLoop() {
         guard loop == nil, let externalClock else { return }
         let l = DCPDisplayLoop(source: source, clock: clock,

@@ -45,10 +45,12 @@ public enum DCPDecodePolicy {
 
     /// The choices to offer: automatic, then every value up to the core count.
     ///
-    /// Above eight the list stops being a list, and the interesting decisions
-    /// (fewer threads to keep the UI smooth, more to survive a 4K reel) are all
-    /// at the low end anyway.
+    /// The ceiling matches the one the automatic value uses. It was eight, on
+    /// the reasoning that the interesting decisions are all at the low end —
+    /// true while the automatic value could not exceed six, and wrong once it
+    /// can reach twelve: the operator could no longer even select what the app
+    /// had picked for them, which makes the two settings impossible to compare.
     public static func choices(cores: Int) -> [Int] {
-        Array(1...max(1, min(cores, 8)))
+        Array(1...max(1, min(cores, 12)))
     }
 }

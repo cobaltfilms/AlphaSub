@@ -186,9 +186,15 @@ public struct DCPInterOpImporter: FormatImporter {
         var hasCustom = false
 
         // VPosition/HPosition are PERCENT offsets from the VAlign/HAlign
-        // anchors (validated sample: VPosition="8.0" VAlign="bottom"). For
-        // multi-line cues the LAST <Text> is the baseline line (lines stack
-        // upward from the anchor), so iterate without breaking.
+        // anchors (validated sample: VPosition="8.0" VAlign="bottom").
+        //
+        // A multi-line cue positions each <Text> independently, and the cue's
+        // own position is the BOTTOM-MOST line's — the anchor the block stacks
+        // upward from. This used to be read as "the LAST <Text> wins", which is
+        // the same line in a file that writes its lines top-to-bottom but a
+        // silent mis-read in one that does not. Collect every line's position
+        // in model terms (0 = bottom edge) and take the lowest instead.
+        var linePercents: [Double] = []
         for textElem in textElems {
             let va = textElem.attribute(forName: "VAlign")?.stringValue?.lowercased() ?? "bottom"
             let vp = textElem.attribute(forName: "VPosition")?.stringValue.flatMap(Double.init)
@@ -207,17 +213,16 @@ public struct DCPInterOpImporter: FormatImporter {
 
             switch va {
             case "top":
-                vpos = vp.map { .percentage(min(100, max(0, 100.0 - $0))) } ?? .safeArea(.top)
+                if let vp { linePercents.append(min(100, max(0, 100.0 - vp))) }
+                else { vpos = .safeArea(.top) }
             case "center":
                 if let vp, vp != 0 {
-                    vpos = .percentage(min(100, max(0, 50.0 + vp)))
+                    linePercents.append(min(100, max(0, 50.0 + vp)))
                 } else {
                     vpos = .safeArea(.center)
                 }
             default: // bottom
-                if let vp {
-                    vpos = .percentage(min(100, max(0, vp)))
-                }
+                if let vp { linePercents.append(min(100, max(0, vp))) }
             }
 
             // Only flag as custom when it deviates from the house default
@@ -228,6 +233,12 @@ public struct DCPInterOpImporter: FormatImporter {
             if !(isDefaultV && isDefaultH) {
                 hasCustom = true
             }
+        }
+
+        // Any line that named a real position outranks the safe-area fallbacks
+        // above, which only stand in when no line declared one at all.
+        if let bottom = linePercents.min() {
+            vpos = .percentage(bottom)
         }
 
         return InteropPosition(vertical: vpos, horizontal: hpos, alignment: align, hasCustomPosition: hasCustom)

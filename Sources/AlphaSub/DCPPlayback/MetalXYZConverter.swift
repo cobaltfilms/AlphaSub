@@ -111,20 +111,24 @@ final class MetalXYZConverter: @unchecked Sendable {
     func pixelBuffer(from frame: GrokDecoder.DecodedFrame,
                      target: ColorSpace = .rec709,
                      adaptation: ChromaticAdaptation = .bradford,
-                     range: ColorRange = .full) -> CVPixelBuffer? {
+                     range: ColorRange = .full,
+                     isColorManaged: Bool = true) -> CVPixelBuffer? {
         let transform = ColorTransform(from: .dcdmXYZ, to: target, adaptation: adaptation)
         guard let parameters = transform.kernelParameters(targetRange: range) else { return nil }
-        return pixelBuffer(from: frame, parameters: parameters, target: target)
+        return pixelBuffer(from: frame, parameters: parameters, target: target,
+                           isColorManaged: isColorManaged)
     }
 
     func pixelBuffer(from frame: GrokDecoder.DecodedFrame,
                      parameters: ColorKernelParameters,
-                     target: ColorSpace) -> CVPixelBuffer? {
+                     target: ColorSpace,
+                     isColorManaged: Bool = true) -> CVPixelBuffer? {
         let info = frame.info
         guard info.componentCount == 3, info.precision <= 16 else { return nil }
         return pixelBuffer(planar: frame.planarData,
                            width: info.width, height: info.height,
-                           parameters: parameters, target: target)
+                           parameters: parameters, target: target,
+                           isColorManaged: isColorManaged)
     }
 
     /// The geometry-only entry point: three contiguous 16-bit planes, no
@@ -135,7 +139,8 @@ final class MetalXYZConverter: @unchecked Sendable {
                      width w: Int,
                      height h: Int,
                      parameters: ColorKernelParameters,
-                     target: ColorSpace) -> CVPixelBuffer? {
+                     target: ColorSpace,
+                     isColorManaged: Bool = true) -> CVPixelBuffer? {
         guard w > 0, h > 0,
               planar.count >= 3 * w * h * MemoryLayout<UInt16>.size else { return nil }
         let frame = planar
@@ -197,7 +202,7 @@ final class MetalXYZConverter: @unchecked Sendable {
             cmd.commit()
             cmd.waitUntilCompleted()
             guard cmd.status == .completed else { return nil }
-            target.tag(pixelBuffer)
+            if isColorManaged { target.tag(pixelBuffer) }
             return pixelBuffer
         }
         }

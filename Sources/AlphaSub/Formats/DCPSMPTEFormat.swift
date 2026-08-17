@@ -129,8 +129,11 @@ public struct DCPSMPTEImporter: FormatImporter {
             else { continue }
 
             var textBlocks: [TextBlock] = []
-            var vposSum: Double = 0
-            var vposCount: Double = 0
+            // Every line's position as a MODEL percentage (0 = bottom edge,
+            // 100 = top), so the cue-level value below can pick the lowest
+            // line regardless of which anchor each line declared.
+            var linePercents: [Double] = []
+            var rawVpositions: [Double] = []
             var parsedHpos: HorizontalPosition = .centered
             var parsedAlign: TextAlignment = .center
             var parsedVertical: VerticalPosition = .safeArea(.bottom)
@@ -142,8 +145,7 @@ public struct DCPSMPTEImporter: FormatImporter {
             // instead of only the direct children, inheriting the Font style.
             for (textElem, inheritedStyle, inheritedColor) in DCPTextTree.texts(in: subElem) {
                 let vpos = parseVPosition(textElem)
-                vposSum += vpos
-                vposCount += 1
+                rawVpositions.append(vpos)
 
                 // Per-line position: ST 428-7 carries Vposition/Valign (and
                 // Hposition/Halign) on EVERY <Text>, and a player draws each
@@ -183,14 +185,15 @@ public struct DCPSMPTEImporter: FormatImporter {
                 let lineValign = textElem.attribute(forName: "Valign")?.stringValue?.lowercased()
                 let hasOwnV = textElem.attribute(forName: "Vposition")?.stringValue != nil
                     || lineValign != nil
+                let linePct: Double
+                switch lineValign {
+                case "top":    linePct = 100.0 - vpos
+                case "center": linePct = 50.0
+                default:       linePct = vpos
+                }
+                linePercents.append(max(0.0, min(100.0, linePct)))
                 if hasOwnV {
-                    let pct: Double
-                    switch lineValign {
-                    case "top":    pct = 100.0 - vpos
-                    case "center": pct = 50.0
-                    default:       pct = vpos
-                    }
-                    blockVertical = .percentage(max(0.0, min(100.0, pct)))
+                    blockVertical = .percentage(max(0.0, min(100.0, linePct)))
                 }
 
                 let segments = parseDCPTextSegments(textElem,
@@ -201,29 +204,35 @@ public struct DCPSMPTEImporter: FormatImporter {
                                             horizontalPosition: blockHorizontal))
             }
 
-            // Resolve vertical position:
-            // - If an explicit Valign was provided, combine it with the average
-            //   Vposition numeric to produce a precise percentage (our model:
-            //   0 = bottom, 100 = top). SMPTE Vposition is the offset from the
-            //   Valign anchor: Valign=bottom, Vposition=14 → 14% up from the
-            //   bottom → .percentage(14) — no conversion; a top anchor counts
-            //   down from the top and is complemented.
-            // - If no Valign, fall back to the legacy heuristic (avgVpos>10 →
-            //   percentage, else safeArea(.bottom)).
-            let avgVpos = vposCount > 0 ? vposSum / vposCount : 8.0
-            if let valign = explicitValign {
-                let pct: Double
-                switch valign {
-                case .top:    pct = max(0.0, min(100.0, 100.0 - avgVpos))
-                case .center: pct = 50.0
-                case .bottom: pct = max(0.0, min(100.0, avgVpos))
-                }
-                parsedVertical = .percentage(pct)
+            // Resolve the cue's vertical position from its lines.
+            //
+            // A DCP gives every <Text> its own Vposition, and a two-line cue is
+            // written as two lines one line-height apart — 8 and 14, say. The
+            // cue-level value used to be their AVERAGE, which reported that cue
+            // at 11: a position neither line occupies, and one that moves when
+            // a cue gains or loses a line. Take the BOTTOM-MOST line instead.
+            // That is the anchor the whole block hangs from — the renderer
+            // stacks upward from the last line, and re-exporting reproduces the
+            // original numbers.
+            //
+            // "Bottom-most" is the smallest MODEL percentage (0 = bottom edge),
+            // which is why the per-line loop above normalises each line's own
+            // Valign anchor before storing it: a cue mixing `Valign="top"` and
+            // `Valign="bottom"` lines still resolves to whichever sits lowest
+            // on screen, not whichever has the smaller raw number.
+            //
+            // The per-line normalisation is also why no second switch on the
+            // cue's `explicitValign` is needed here: that variable only ever
+            // held the LAST line's anchor, and each line has already been
+            // converted through its own.
+            let bottomPct = linePercents.min() ?? 8.0
+            if explicitValign != nil {
+                parsedVertical = .percentage(max(0.0, min(100.0, bottomPct)))
             } else if hasPositionData {
                 // Has Hposition/Halign but no Valign — use safeArea default.
                 parsedVertical = .safeArea(.bottom)
-            } else if avgVpos > 10.0 {
-                parsedVertical = .percentage(avgVpos)
+            } else if (rawVpositions.min() ?? 8.0) > 10.0 {
+                parsedVertical = .percentage(bottomPct)
             } else {
                 parsedVertical = .safeArea(.bottom)
             }

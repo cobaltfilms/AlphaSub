@@ -94,6 +94,43 @@ public actor DCPFrameSource {
         let globalOffset: Int
     }
 
+    /// Everything that decides what a decoded X'Y'Z' frame LOOKS like, in one
+    /// value.
+    ///
+    /// The three travel together on purpose. They are read as a set by both
+    /// converters, and a caller that changed the space but forgot the range
+    /// would get a picture that is correct in hue and wrong in contrast — the
+    /// kind of fault that is easy to mistake for a bad master. Bundling them
+    /// also gives the "did this actually change?" check one thing to compare,
+    /// which is what stops a redundant settings write from flushing a warm
+    /// cache mid-playback.
+    public struct ColorTreatment: Equatable, Sendable {
+        /// Display space the DCDM X'Y'Z' is decoded into.
+        public var target: ColorSpace
+        /// White-point adaptation between DCI white and the target's white.
+        public var adaptation: ChromaticAdaptation
+        /// Whether the encoded result uses the full 0–255 code range or the
+        /// legal/video 16–235 window.
+        public var range: ColorRange
+        /// Tag the converted buffer with `target` so ColorSync applies the
+        /// display's own profile on the way to the screen.
+        ///
+        /// Off hands the display the code values untouched, which is what an
+        /// operator wants when the monitor is already calibrated for the space
+        /// being produced and a second transform would double-correct it.
+        public var isColorManaged: Bool
+
+        public init(target: ColorSpace = .rec709,
+                    adaptation: ChromaticAdaptation = .bradford,
+                    range: ColorRange = .full,
+                    isColorManaged: Bool = true) {
+            self.target = target
+            self.adaptation = adaptation
+            self.range = range
+            self.isColorManaged = isColorManaged
+        }
+    }
+
     public let frameCount: Int
     /// Reduced-resolution decode level actually used (0 = full res).
     public let reduceLevel: Int
@@ -101,12 +138,19 @@ public actor DCPFrameSource {
     private var segments: [Segment] = []
     private var map: ReelSegmentMap = ReelSegmentMap(counts: [])
     private let decoder: GrokDecoder
-    private let converter: XYZColorConverter
+    private var converter: XYZColorConverter
     /// Display space frames are converted into, and the GPU form of that same
     /// transform so the Metal path cannot drift from the CPU one.
-    public let colorTarget: ColorSpace
-    private let kernelParameters: ColorKernelParameters?
+    private(set) var treatment: ColorTreatment
+    private var kernelParameters: ColorKernelParameters?
+    /// Bumped whenever `treatment` changes, so a decode that started under the
+    /// previous one can be recognised as stale when it lands.
+    private var colorGeneration = 0
     private let capacity: Int
+
+    /// The display space frames are converted into, kept for callers that only
+    /// want the space.
+    public var colorTarget: ColorSpace { treatment.target }
 
     private var cache: [Int: DisplayFrame] = [:]
     private var lru: [Int] = []
@@ -122,13 +166,13 @@ public actor DCPFrameSource {
                 reduceLevel: Int? = nil,
                 cacheCapacity: Int = 64,
                 maxConcurrentDecodes: Int = DCPFrameSource.defaultConcurrency,
-                colorTarget: ColorSpace = .rec709,
-                colorAdaptation: ChromaticAdaptation = .bradford) throws {
+                treatment: ColorTreatment = ColorTreatment(),
+                editRate: Double = 24) throws {
         let reader = try MXFPictureReader(url: pictureURL, pictureKey: pictureKey)
         try self.init(segments: [(reader, pictureKey)], decoder: decoder,
                       reduceLevel: reduceLevel, cacheCapacity: cacheCapacity,
                       maxConcurrentDecodes: maxConcurrentDecodes,
-                      colorTarget: colorTarget, colorAdaptation: colorAdaptation)
+                      treatment: treatment, editRate: editRate)
     }
 
     /// Multi-reel init: one (reader, key) pair per reel that has a picture
@@ -140,8 +184,8 @@ public actor DCPFrameSource {
                 reduceLevel: Int? = nil,
                 cacheCapacity: Int = 64,
                 maxConcurrentDecodes: Int = DCPFrameSource.defaultConcurrency,
-                colorTarget: ColorSpace = .rec709,
-                colorAdaptation: ChromaticAdaptation = .bradford) throws {
+                treatment: ColorTreatment = ColorTreatment(),
+                editRate: Double = 24) throws {
         guard !segments.isEmpty else {
             throw MXFPictureReader.ReaderError.noPictureFrames
         }
@@ -149,10 +193,9 @@ public actor DCPFrameSource {
         self.decoder = decoder
         self.capacity = max(4, cacheCapacity)
         self.gate = DecodeGate(limit: concurrency)
-        self.colorTarget = colorTarget
-        self.converter = XYZColorConverter(target: colorTarget, adaptation: colorAdaptation)
-        self.kernelParameters = ColorTransform(from: .dcdmXYZ, to: colorTarget,
-                                               adaptation: colorAdaptation).kernelParameters()
+        self.treatment = treatment
+        self.converter = Self.makeConverter(treatment)
+        self.kernelParameters = Self.makeKernelParameters(treatment)
 
         var built: [Segment] = []
         var globalOffset = 0
@@ -173,26 +216,66 @@ public actor DCPFrameSource {
 
         // Pick a preview reduce level from the first segment's first frame
         // unless the caller pinned one (e.g. full res for a still export).
+        // Whether full resolution is affordable depends on how many decode
+        // workers this source actually got, so the pool size is part of the
+        // decision rather than something the geometry has to guess at.
         if let reduceLevel {
             self.reduceLevel = max(0, reduceLevel)
         } else if let first = built.first,
                   let cs = try? first.reader.codestream(at: 0),
                   let info = try? J2KCodestreamInfo(codestream: cs) {
-            self.reduceLevel = info.previewReduceLevel
+            self.reduceLevel = info.previewReduceLevel(
+                sustainsFullResolution: Self.sustainsFullResolution(concurrency: concurrency,
+                                                                    editRate: editRate))
         } else {
             self.reduceLevel = 1
         }
     }
 
+    /// Frames per second one decode worker sustains on a full-res 2K stream.
+    ///
+    /// MEASURED end-to-end (read → `grk_decompress` → colour convert → cache)
+    /// on a 14-core Apple Silicon Mac against a 2K SMPTE package:
+    ///
+    ///     6 workers → 33 fps    8 → 40 fps    10 → 51 fps    12 → 55 fps
+    ///
+    /// which is ~5 fps per worker, falling off slightly as the machine runs
+    /// out of cores. The figure this replaced — "~104 ms per frame, so 24 fps
+    /// needs 2.5 in flight" — implied 9.6 fps per worker, nearly twice what
+    /// the pipeline actually delivers; sizing the pool from it is what left
+    /// playback at 33 fps against a 24 fps target, close enough to the line
+    /// that any competing work dropped it below real time.
+    public static let framesPerSecondPerWorker = 5.0
+
+    /// Cores deliberately left unused. SwiftUI's own 60 Hz work — playhead,
+    /// subtitle overlay, waveform — has to run somewhere, and a decode pool
+    /// sized to every core starves the main thread: the picture gets faster
+    /// and the app gets worse.
+    private static let coresReservedForUI = 4
+
     public static var defaultConcurrency: Int {
-        // Each decode is a single-threaded grk_decompress process costing
-        // ~104 ms for a full-res 2K frame (measured), so 24 fps needs at least
-        // 2.5 of them in flight; below that the picture stutters no matter how
-        // fast the display loop runs. Five gives ~48 fps of headroom for
-        // shuttle and seek while still leaving cores for the UI and the
-        // timecode — saturating every core starves the main thread.
-        let perf = ProcessInfo.processInfo.activeProcessorCount
-        return max(3, min(6, perf / 2))
+        // Each decode is one single-threaded `grk_decompress` process, so
+        // throughput is very nearly the worker count times the rate above and
+        // the only question is how many the machine can spare. Take everything
+        // outside the UI reserve, with a floor for small machines (below three
+        // the picture cannot keep up at any resolution) and a ceiling past
+        // which the per-worker rate has stopped improving.
+        let cores = ProcessInfo.processInfo.activeProcessorCount
+        return max(3, min(12, cores - coresReservedForUI))
+    }
+
+    /// Whether `concurrency` workers can hold `editRate` at full resolution
+    /// with enough in hand for a shuttle or a seek.
+    ///
+    /// The margin is what makes this worth asking. Decoding at exactly real
+    /// time means every frame arrives just as it is needed and any hiccup is a
+    /// dropped frame, so a stream that cannot clear the rate by half again is
+    /// better previewed one wavelet level down — which costs half the linear
+    /// resolution and buys 2.2× the throughput (74 fps against 33 on the
+    /// machine above).
+    static func sustainsFullResolution(concurrency: Int, editRate: Double) -> Bool {
+        let sustained = Double(concurrency) * framesPerSecondPerWorker
+        return sustained >= max(editRate, 1) * 1.5
     }
 
     public var isAvailable: Bool { decoder.isAvailable }
@@ -241,6 +324,44 @@ public actor DCPFrameSource {
         prefetch(around: index, ahead: ahead, behind: behind)
     }
 
+    // MARK: Colour
+
+    private static func makeConverter(_ t: ColorTreatment) -> XYZColorConverter {
+        XYZColorConverter(target: t.target, adaptation: t.adaptation,
+                          range: t.range, isColorManaged: t.isColorManaged)
+    }
+
+    private static func makeKernelParameters(_ t: ColorTreatment) -> ColorKernelParameters? {
+        ColorTransform(from: .dcdmXYZ, to: t.target, adaptation: t.adaptation)
+            .kernelParameters(targetRange: t.range)
+    }
+
+    /// Change how frames are converted, on a source that is already playing.
+    ///
+    /// Both converters are rebuilt and the cache is dropped, because a cached
+    /// frame is a frame that has ALREADY been through the old transform —
+    /// keeping it would leave the operator looking at a mix of two colour
+    /// treatments and conclude the setting does nothing. The decision was
+    /// previously baked in at init and documented as "takes effect on the next
+    /// composition opened", which is the same thing as far as anyone changing
+    /// the preference and watching the picture is concerned.
+    ///
+    /// A no-op change returns early: this is called from a settings observer,
+    /// which fires for every property on the object, and flushing a warm cache
+    /// because the audio gain moved would stutter the picture for no reason.
+    public func setColorTreatment(_ new: ColorTreatment) {
+        guard new != treatment else { return }
+        treatment = new
+        colorGeneration &+= 1
+        converter = Self.makeConverter(new)
+        kernelParameters = Self.makeKernelParameters(new)
+        // In-flight decodes were armed with the old transform; let them land
+        // and be discarded rather than cancelling — `store` drops frames for a
+        // generation that is no longer current.
+        cache.removeAll()
+        lru.removeAll()
+    }
+
     /// Full reset — cancels everything and drops the cache (~2 MB per frame,
     /// 64 frames). Teardown only: swapping the source, closing the DCP. A
     /// position jump wants `reposition`, which keeps the cache warm.
@@ -259,7 +380,8 @@ public actor DCPFrameSource {
         }
         let decoder = self.decoder            // Sendable struct
         let converter = self.converter        // Sendable struct
-        let target = self.colorTarget
+        let target = self.treatment.target
+        let managed = self.treatment.isColorManaged
         let parameters = self.kernelParameters
         let gate = self.gate                  // actor
         let reduce = self.reduceLevel
@@ -281,7 +403,8 @@ public actor DCPFrameSource {
             // Favour the GPU for the colour conversion; fall back to CPU.
             let pb: CVPixelBuffer
             if let gpu = MetalXYZConverter.shared, let parameters,
-               let g = gpu.pixelBuffer(from: decoded, parameters: parameters, target: target) {
+               let g = gpu.pixelBuffer(from: decoded, parameters: parameters,
+                                       target: target, isColorManaged: managed) {
                 pb = g
             } else {
                 pb = try converter.pixelBuffer(from: decoded)
@@ -290,9 +413,10 @@ public actor DCPFrameSource {
                                 width: decoded.info.width, height: decoded.info.height)
         }
         inFlight[index] = (id, task)
+        let generation = colorGeneration
         Task { [weak self] in
             let result = await task.result
-            await self?.store(index: index, id: id, result: result)
+            await self?.store(index: index, id: id, generation: generation, result: result)
         }
         return task
     }
@@ -314,11 +438,16 @@ public actor DCPFrameSource {
         return segments[loc.segment]
     }
 
-    private func store(index: Int, id: UUID, result: Result<DisplayFrame, Error>) {
+    private func store(index: Int, id: UUID, generation: Int,
+                       result: Result<DisplayFrame, Error>) {
         // Only the task still tracked for this index may clear its slot — a
         // cancelled task's late completion must not drop a replacement.
         if inFlight[index]?.id == id { inFlight[index] = nil }
         guard case .success(let frame) = result else { return }
+        // Converted under a colour treatment the operator has since changed:
+        // showing it would put a frame of the old look in the middle of the
+        // new one, which reads as the setting working intermittently.
+        guard generation == colorGeneration else { return }
         cache[index] = frame
         touch(index)
         evictIfNeeded()

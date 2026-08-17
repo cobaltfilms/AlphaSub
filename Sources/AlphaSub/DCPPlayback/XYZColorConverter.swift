@@ -31,6 +31,10 @@ public struct XYZColorConverter {
     /// White-point adaptation between DCI white and the target's white.
     public let adaptation: ChromaticAdaptation
 
+    /// Whether converted buffers carry a CGColorSpace tag for ColorSync.
+    /// Untagged, the system shows the code values as-is on the display.
+    public let isColorManaged: Bool
+
     private let pipeline: ColorPipeline
 
     /// Defaults reproduce the shipped playback path's target — Rec.709
@@ -39,9 +43,11 @@ public struct XYZColorConverter {
     /// out about 15 % too dark — but with chromatic adaptation now applied.
     public init(target: ColorSpace = .rec709,
                 adaptation: ChromaticAdaptation = .bradford,
-                range: ColorRange = .full) {
+                range: ColorRange = .full,
+                isColorManaged: Bool = true) {
         self.target = target
         self.adaptation = adaptation
+        self.isColorManaged = isColorManaged
         self.pipeline = ColorPipeline(from: .dcdmXYZ, to: target,
                                       adaptation: adaptation,
                                       sourceBitDepth: DCDM.bitDepth,
@@ -84,7 +90,7 @@ public struct XYZColorConverter {
                                    destinationStride: dstStride,
                                    order: .bgra)
         }
-        target.tag(buffer)
+        if isColorManaged { target.tag(buffer) }
         return buffer
     }
 

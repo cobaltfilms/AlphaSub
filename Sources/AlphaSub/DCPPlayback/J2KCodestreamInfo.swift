@@ -74,7 +74,10 @@ public struct J2KCodestreamInfo: Sendable, Equatable {
     }
 
     /// Private full init for deriving a reduced-resolution variant.
-    private init(width: Int, height: Int, componentCount: Int, precision: Int, rsiz: Int) {
+    /// Internal rather than private so a test can state a geometry directly —
+    /// the reduce-level decision is about width, and synthesising a whole
+    /// codestream to assert on one number tests the SIZ parser instead.
+    init(width: Int, height: Int, componentCount: Int, precision: Int, rsiz: Int) {
         self.width = width; self.height = height
         self.componentCount = componentCount; self.precision = precision; self.rsiz = rsiz
     }
@@ -91,20 +94,32 @@ public struct J2KCodestreamInfo: Sendable, Equatable {
                                  precision: precision, rsiz: rsiz)
     }
 
-    /// A sensible reduce level for real-time preview: aim for ~1024px wide.
-    /// 2K → 1 (1024), 4K → 2 (1024), already-small → 0.
-    /// Decode-time reduction for playback. MEASURED on real DCI streams
-    /// (DecodeIntegrityTests, 2026-07-30): a 2K frame costs 103.7 ms full-res
-    /// vs 100.6 ms at reduce 1 — 3%. Per-frame cost is dominated by the
-    /// grk_decompress process (spawn + temp file + pipe), not by the pixels, so
-    /// decoding a preview-sized picture threw away half the resolution in each
-    /// direction to save nothing. 2K and below therefore decode FULL RES.
+    /// Decode-time resolution reduction for real-time preview.
     ///
-    /// 4K still reduces once — 4× the pixel work is the one case where the
-    /// pixel term stops being noise — which lands it at 2K, the display's
-    /// resolution anyway.
-    public var previewReduceLevel: Int {
+    /// 4K always reduces once, landing at 2K — the display's resolution anyway,
+    /// and 4× the pixel work is not something any core count absorbs.
+    ///
+    /// 2K is the interesting case, and the honest answer depends on the
+    /// machine. It used to be a flat "full res", justified by a measurement
+    /// claiming a 2K frame cost 103.7 ms full-res against 100.6 ms at reduce 1
+    /// — a 3 % difference, from which it followed that the `grk_decompress`
+    /// process (spawn, temp file, pipe) dominated and reducing threw away half
+    /// the resolution in each direction to save nothing.
+    ///
+    /// Re-measured through the whole pipeline under concurrency, that is not
+    /// what happens: the same 48 frames take 1.44 s full-res and 0.64 s at
+    /// reduce 1 — **2.2× faster**, 33 fps against 74. The original figure was
+    /// taken one frame at a time, where the fixed process cost really does
+    /// swamp the pixels; once several decodes run at once the fixed cost
+    /// overlaps and the pixel work is what is left. Deciding a concurrent
+    /// pipeline's resolution from a serial measurement is what put full-res 2K
+    /// playback at 33 fps — above a 24 fps target on paper, and below it in
+    /// practice as soon as anything else wanted the CPU.
+    ///
+    /// So: reduce 2K only when the pool cannot hold the rate at full
+    /// resolution. A machine with cores to spare still shows every pixel.
+    public func previewReduceLevel(sustainsFullResolution: Bool) -> Int {
         if width >= 3600 { return 1 }
-        return 0
+        return sustainsFullResolution ? 0 : 1
     }
 }
