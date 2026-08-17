@@ -511,7 +511,7 @@ public struct DCPSMPTEExporter: FormatExporter {
         // fall back to a fresh UUID / reel 1.
         let reelUUID = opts.extra["dcp_resource_id"] ?? UUID().uuidString.lowercased()
         let reelNumber = opts.extra["dcp_reel_number"] ?? "1"
-        let issueDate = ISO8601DateFormatter().string(from: Date())
+        let issueDate = DCPIssueDate.string()
 
         let loadFontAttr = schemaVersion.loadFontAttributeCase
         // Bilingual tracks emit "mul" by default (see dcpLanguageBalise); the
