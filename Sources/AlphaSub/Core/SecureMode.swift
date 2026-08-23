@@ -19,12 +19,24 @@ public enum SecureMode {
     /// UserDefaults key backing ``isEnabled``.
     public static let defaultsKey = "com.alphasub.secureModeEnabled"
 
+    /// Where the flag is stored. `.standard` in the app.
+    ///
+    /// Injectable for tests only, and not a nicety: `swift test --parallel`
+    /// runs each suite in its own xctest process, and every one of them shares
+    /// the `com.apple.dt.xctest.tool` defaults domain. A suite that toggled
+    /// this flag was therefore visible to unrelated suites running at the same
+    /// time — a DeepL test failed with "wrong error secureMode" because a
+    /// Core test happened to have the mode on — and a suite that crashed
+    /// mid-run left the flag set for every run afterwards, on disk. A test
+    /// points this at its own throwaway suite instead.
+    public static var defaults: UserDefaults = .standard
+
     /// Posted on the default `NotificationCenter` after the mode changes.
     public static let didChangeNotification = Notification.Name("AlphaSubSecureModeDidChange")
 
     /// True while Secure Mode (air-gap operation) is active.
     public static var isEnabled: Bool {
-        UserDefaults.standard.bool(forKey: defaultsKey)
+        defaults.bool(forKey: defaultsKey)
     }
 
     /// Flip the mode. Records the transition in the audit log (the disable
@@ -33,11 +45,11 @@ public enum SecureMode {
     public static func setEnabled(_ enabled: Bool) {
         guard enabled != isEnabled else { return }
         if enabled {
-            UserDefaults.standard.set(true, forKey: defaultsKey)
+            defaults.set(true, forKey: defaultsKey)
             AuditLog.shared.record(.secureModeEnabled, detail: "Secure Mode turned on")
         } else {
             AuditLog.shared.record(.secureModeDisabled, detail: "Secure Mode turned off")
-            UserDefaults.standard.set(false, forKey: defaultsKey)
+            defaults.set(false, forKey: defaultsKey)
         }
         NotificationCenter.default.post(name: didChangeNotification, object: nil)
     }

@@ -144,8 +144,17 @@ public struct GrokDecoder: Sendable {
         return DecodedFrame(info: info, planarData: run.output)
     }
 
-    /// One `grk_decompress` invocation. Drains stdout on a background thread
-    /// so a large frame can't deadlock the pipe while the process writes.
+    /// One `grk_decompress` invocation. Drains stdout and stderr on dedicated
+    /// threads so a large frame can't deadlock the pipe while the process
+    /// writes — and so the drains cannot be starved by the caller's own
+    /// thread pool: this runs on a Swift-concurrency cooperative thread (one
+    /// per concurrent decode), and export decodes on EVERY core. When all
+    /// pool threads are parked in this read, a `DispatchQueue.async` drain
+    /// never gets a thread, the child blocks writing to a full stdout pipe,
+    /// stderr never reaches EOF, and the export wedges at 0% with zero CPU
+    /// (2026-08-17: reproduced; `sample` showed every cooperative thread in
+    /// this read and 14 grk children blocked in `__swrite` on stdout).
+    /// A real `Thread` runs regardless of pool state.
     private func runGrok(_ grok: String, arguments: [String], threads: Int) throws
         -> (status: Int32, crashed: Bool, output: Data, errorTail: String) {
         let proc = Process()
@@ -158,17 +167,30 @@ public struct GrokDecoder: Sendable {
         proc.standardError = errPipe
 
         var outData = Data()
-        let outHandle = outPipe.fileHandleForReading
+        var errData = Data()
         let group = DispatchGroup()
         group.enter()
-        DispatchQueue.global(qos: .userInitiated).async {
-            outData = outHandle.readDataToEndOfFile()
+        group.enter()
+        let outThread = Thread {
+            outData = outPipe.fileHandleForReading.readDataToEndOfFile()
             group.leave()
         }
+        let errThread = Thread {
+            errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            group.leave()
+        }
+        outThread.qualityOfService = qualityOfService
+        errThread.qualityOfService = qualityOfService
+        outThread.start()
+        errThread.start()
         do { try proc.run() } catch {
+            // No child ever owned the pipes' write ends, so the drains would
+            // never see EOF — close them and join before throwing.
+            try? outPipe.fileHandleForWriting.close()
+            try? errPipe.fileHandleForWriting.close()
+            group.wait()
             throw DecodeError.decodeFailed(error.localizedDescription)
         }
-        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
         proc.waitUntilExit()
         group.wait()
 

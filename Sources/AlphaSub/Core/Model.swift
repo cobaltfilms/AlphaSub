@@ -1182,6 +1182,35 @@ public struct Track: Codable, Identifiable {
         return track
     }
 
+    /// Baby-sync only the cues in `ids`, leaving every other cue where it is.
+    ///
+    /// The anchors are the first and last SELECTED cue, not the track's — the
+    /// point of a partial sync is that one stretch of the film has drifted
+    /// (a reel change, a re-cut scene) while the rest is already in sync.
+    /// `timecodeOffset` is deliberately left alone: the track's base hasn't
+    /// moved, only a passage inside it.
+    public func babySync(ids: Set<UUID>, firstTarget: Timecode, lastTarget: Timecode) -> Track {
+        let selected = subtitles.filter { ids.contains($0.id) }
+        guard selected.count >= 2 else { return offset(ids: ids, to: firstTarget) }
+        let oldFirst = selected.map(\.startTime.totalFrames).min()!
+        let oldLast  = selected.map(\.startTime.totalFrames).max()!
+        let oldRange = oldLast - oldFirst
+        guard oldRange > 0 else { return offset(ids: ids, to: firstTarget) }
+
+        let ratio = Double(lastTarget.totalFrames - firstTarget.totalFrames) / Double(oldRange)
+        var track = self
+        track.subtitles = subtitles.map { sub in
+            guard ids.contains(sub.id) else { return sub }
+            var s = sub
+            let newStart = firstTarget.totalFrames + Int64(Double(sub.startTime.totalFrames - oldFirst) * ratio)
+            let newEnd   = firstTarget.totalFrames + Int64(Double(sub.endTime.totalFrames   - oldFirst) * ratio)
+            s.startTime = Timecode(totalFrames: max(0, newStart), frameRate: firstTarget.frameRate)
+            s.endTime   = Timecode(totalFrames: max(newStart, newEnd), frameRate: firstTarget.frameRate)
+            return s
+        }
+        return track
+    }
+
     public func convertFrameRate(to newFrameRate: FrameRate) -> Track {
         var track = self
         track.subtitles = subtitles.map { sub in
@@ -1435,6 +1464,15 @@ public struct SubtitleDocument: Codable {
 
     public mutating func babySync(firstTarget: Timecode, lastTarget: Timecode) {
         tracks = tracks.map { $0.babySync(firstTarget: firstTarget, lastTarget: lastTarget) }
+    }
+
+    /// Baby-sync just the cues in `ids`. Tracks holding none of them come back
+    /// untouched, so this is safe to run across the whole document.
+    public mutating func babySync(ids: Set<UUID>, firstTarget: Timecode, lastTarget: Timecode) {
+        tracks = tracks.map { track in
+            guard track.subtitles.contains(where: { ids.contains($0.id) }) else { return track }
+            return track.babySync(ids: ids, firstTarget: firstTarget, lastTarget: lastTarget)
+        }
     }
 
     public mutating func convertFrameRate(to newFrameRate: FrameRate) {
