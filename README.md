@@ -11,6 +11,26 @@ AlphaSub app is built on, extracted as a reusable Swift package under Apache-2.0
 > translation, diarization), professional broadcast/cinema delivery formats, and
 > licensing — lives in a separate repository and is **not** part of this package.
 
+## Two apps, both in release candidate
+
+**[AlphaSUB 1.6.0 RC1](https://github.com/cobaltfilms/AlphaSub/releases/tag/v1.6.0rc1)**
+— professional subtitling for macOS. Frame-accurate editing against picture and
+waveform, DCP picture playback, on-device transcription, translation and speaker
+diarization, Blackmagic SDI monitoring, and delivery to every format a broadcaster
+or a cinema asks for.
+
+**[AlphaDCP 1.0.0 RC1](https://github.com/cobaltfilms/AlphaSub/releases/tag/alphadcp-v1.0.0rc1)**
+— DCP mastering, new. Build a package on a reel timeline and *watch* it before you
+generate it: real JPEG 2000 playback, encryption and KDMs, and conformance checking
+against SMPTE and Bv2.1 that runs as you type rather than as a report afterwards.
+
+AlphaSUB reads DCPs; AlphaDCP builds them. Both at
+[alpha-sub.com](https://alpha-sub.com).
+
+Release candidates are feature-complete — fixes only from here. If you cut
+subtitles or master DCPs for a living, real packages and real complaints are the
+most useful thing you can send us.
+
 ## What's here
 
 **`AlphaSubCore`** — the data model and format protocols:
