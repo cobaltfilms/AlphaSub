@@ -54,8 +54,9 @@ final class DCPDisplayLoop: @unchecked Sendable {
     /// the same frames. Mutated only on `queue`.
     private var layers: [AVSampleBufferDisplayLayer] = []
     /// Optional per-frame hook (e.g. DeckLink SDI output) receiving the shown
-    /// pixel buffer. Called on `queue`.
-    var onFrame: (@Sendable (CVPixelBuffer) -> Void)?
+    /// pixel buffer. Called on `queue`, and — like `layers` — mutated only on
+    /// `queue`: `setFrameHook` hops, so nothing else may touch this directly.
+    private var onFrame: (@Sendable (CVPixelBuffer) -> Void)?
 
     private let source: DCPFrameSource
     private let clock: DCPPlaybackClock
@@ -91,6 +92,21 @@ final class DCPDisplayLoop: @unchecked Sendable {
     func removeLayer(_ layer: AVSampleBufferDisplayLayer) {
         queue.async { [weak self] in
             self?.layers.removeAll { $0 === layer }
+        }
+    }
+
+    /// Install (or clear) the per-frame hook.
+    ///
+    /// Hops to `queue` for the same reason `addLayer` does. The hook is
+    /// assigned from the main actor — every playback start re-attaches it, and
+    /// starting or stopping SDI output sets and clears it — while the display
+    /// loop reads it on `queue` at frame rate. Writing the closure reference
+    /// straight across those two threads is a data race, and the way it shows
+    /// up is the card going quiet: the loop keeps calling a hook that the
+    /// other thread has already replaced, or reads a half-published one.
+    func setFrameHook(_ hook: (@Sendable (CVPixelBuffer) -> Void)?) {
+        queue.async { [weak self] in
+            self?.onFrame = hook
         }
     }
 

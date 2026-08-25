@@ -91,7 +91,7 @@ public final class DCPPlayer: ObservableObject {
     /// to stop. Called on the display queue with the display-resolution buffer.
     public func setFrameHook(_ hook: (@Sendable (CVPixelBuffer) -> Void)?) {
         ensureLoop()
-        loop?.onFrame = hook
+        loop?.setFrameHook(hook)
     }
 
     /// Change how the picture is converted while it is on screen.

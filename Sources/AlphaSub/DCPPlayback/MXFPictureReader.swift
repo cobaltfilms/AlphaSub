@@ -222,7 +222,7 @@ public final class MXFPictureReader {
             // enough for the triplet header. Either way, partition packs, header
             // metadata and index tables are skipped.
             if length >= 4 {
-                let peekCount = Int(min(length, 96))
+                let peekCount = Int(min(length, UInt64(Self.essenceVerifyBytes)))
                 let peek = try handle.read(upToCount: peekCount) ?? Data()
                 if Array(peek.prefix(4)) == Self.socMarker {
                     frames.append(FrameEntry(klvOffset: keyStart,
@@ -312,8 +312,12 @@ public final class MXFPictureReader {
         //    element where the table says it is — an index table that
         //    disagrees with the essence is worse than none, and cheap to
         //    disprove.
+        // 160 bytes, not 32: enough for a KLV key, a long-form BER length and
+        // the whole 429-6 triplet header that `essenceKind` may need to read
+        // (16 + 9 + 25 + 17 + 25 + 17 + 9 = 118 in the worst case).
         try handle.seek(toOffset: bounds[0])
-        guard let head = try handle.read(upToCount: 32), head.count == 32,
+        guard let head = try handle.read(upToCount: Self.essenceVerifyBytes),
+              head.count >= 20,
               Array(head.prefix(4)) == Self.ulPrefix,
               let encrypted = Self.essenceKind(head) else { return [] }
 
@@ -438,18 +442,41 @@ public final class MXFPictureReader {
     /// Whether a KLV key at the head of `head` is a picture essence element
     /// (plaintext) or a SMPTE 429-6 encrypted triplet. nil for anything else,
     /// which means the index table did not point where it claimed to.
-    private static func essenceKind(_ head: Data) -> Bool? {
+    ///
+    /// The KEY decides, and it decides first. The value peek below is only a
+    /// second opinion, because the caller can only afford to read the first
+    /// few dozen bytes and a 429-6 triplet header does not fit in them: with
+    /// long-form BER on each field — which is what both asdcplib and easyDCP
+    /// write — the header runs to 68 bytes before the ESV even starts. Asking
+    /// the value first meant the fast index gave up on EVERY encrypted DCP and
+    /// fell back to walking every KLV in the file. On a 137 GB feature reel
+    /// that is not a slow path, it is a picture that never appears.
+    static func essenceKind(_ head: Data) -> Bool? {
         let key = Array(head.prefix(16))
         // ST 429-4 JPEG2000 picture element: …0d.01.03.01.15.01.08.01.
-        if key.count >= 14, key[10] == 0x03, key[11] == 0x01, key[12] == 0x15 { return false }
-        // ST 429-6 encrypted triplet.
+        if key.count >= 16, key[10] == 0x03, key[11] == 0x01, key[12] == 0x15 { return false }
+        // ST 429-6 encrypted triplet: …0d.01.03.01.02.7e.01.00.
+        //
+        // 0x7E is at byte THIRTEEN. This read byte twelve, which is 0x02 in
+        // every real file, so the check never once fired — and because it was
+        // the last resort after the value peek that could not fit, nothing
+        // classified an encrypted frame here at all.
+        if key.count >= 16, key[10] == 0x03, key[11] == 0x01,
+           key[12] == 0x02, key[13] == 0x7E { return true }
+        // Second opinion, for a file whose key we do not recognise but whose
+        // value is unmistakably a picture triplet. Needs the whole header to
+        // be present; harmless when it is not.
         if let (valueStart, _) = parseKLVHeader(head), valueStart < head.count {
             let peek = head.subdata(in: valueStart ..< head.count)
             if DCPEssenceDecryptor.isEncryptedFrame(peek, kind: .picture) { return true }
         }
-        if key.count >= 14, key[5] == 0x04, key[12] == 0x7E { return true }
         return nil
     }
+
+    /// How much of a frame's first bytes is enough to classify it: a KLV key,
+    /// its BER length, and a complete SMPTE 429-6 triplet header written with
+    /// long-form BER throughout.
+    static let essenceVerifyBytes = 160
 
     /// KLV key + BER length → (value start index, value length), or nil when
     /// the bytes are not a well-formed header.
