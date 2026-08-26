@@ -89,9 +89,39 @@ public actor DCPFrameSource {
     /// global-frame-index order to form the full composition timeline.
     struct Segment {
         let reader: MXFPictureReader
+        /// First frame of the file this segment plays — the reel's EntryPoint.
+        /// Non-zero whenever the CPL windows the essence, which is the normal
+        /// case for a reel whose asset is longer than the reel.
+        let entryPoint: Int
         let localFrameCount: Int
         /// First global frame index covered by this segment.
         let globalOffset: Int
+    }
+
+    /// One reel's picture, as the composition windows it.
+    ///
+    /// `entryPoint` and `duration` are the CPL's, not the file's. A reel plays
+    /// the slice its composition asks for: an asset assigned in the reel editor
+    /// is trimmed to the reel's length rather than redefining it (RDD 52 §8.2
+    /// wants every track in a reel to share one Duration), so a source that
+    /// concatenated whole MXFs put every later reel at the wrong time the
+    /// moment one asset stopped matching its reel exactly.
+    public struct PictureSegment: Sendable {
+        public let reader: MXFPictureReader
+        public let pictureKey: Data?
+        /// First frame of the file to play. Clamped to the file on open.
+        public let entryPoint: Int
+        /// Frames to play from `entryPoint`, or nil for "to the end of the
+        /// file" — what a loose MXF with no composition around it means.
+        public let duration: Int?
+
+        public init(reader: MXFPictureReader, pictureKey: Data? = nil,
+                    entryPoint: Int = 0, duration: Int? = nil) {
+            self.reader = reader
+            self.pictureKey = pictureKey
+            self.entryPoint = entryPoint
+            self.duration = duration
+        }
     }
 
     /// Everything that decides what a decoded X'Y'Z' frame LOOKS like, in one
@@ -169,7 +199,8 @@ public actor DCPFrameSource {
                 treatment: ColorTreatment = ColorTreatment(),
                 editRate: Double = 24) throws {
         let reader = try MXFPictureReader(url: pictureURL, pictureKey: pictureKey)
-        try self.init(segments: [(reader, pictureKey)], decoder: decoder,
+        try self.init(segments: [PictureSegment(reader: reader, pictureKey: pictureKey)],
+                      decoder: decoder,
                       reduceLevel: reduceLevel, cacheCapacity: cacheCapacity,
                       maxConcurrentDecodes: maxConcurrentDecodes,
                       treatment: treatment, editRate: editRate)
@@ -180,6 +211,23 @@ public actor DCPFrameSource {
     /// sound-only reel). The reduce level is picked from the first segment's
     /// first frame so all reels decode at the same preview resolution.
     public init(segments: [(reader: MXFPictureReader, pictureKey: Data?)],
+                decoder: GrokDecoder = GrokDecoder(),
+                reduceLevel: Int? = nil,
+                cacheCapacity: Int = 64,
+                maxConcurrentDecodes: Int = DCPFrameSource.defaultConcurrency,
+                treatment: ColorTreatment = ColorTreatment(),
+                editRate: Double = 24) throws {
+        try self.init(segments: segments.map {
+                          PictureSegment(reader: $0.reader, pictureKey: $0.pictureKey)
+                      },
+                      decoder: decoder,
+                      reduceLevel: reduceLevel, cacheCapacity: cacheCapacity,
+                      maxConcurrentDecodes: maxConcurrentDecodes,
+                      treatment: treatment, editRate: editRate)
+    }
+
+    /// Multi-reel init honouring each reel's window into its picture file.
+    public init(segments: [PictureSegment],
                 decoder: GrokDecoder = GrokDecoder(),
                 reduceLevel: Int? = nil,
                 cacheCapacity: Int = 64,
@@ -199,10 +247,19 @@ public actor DCPFrameSource {
 
         var built: [Segment] = []
         var globalOffset = 0
-        for (reader, _) in segments {
-            let count = try reader.frameCount()
+        for segment in segments {
+            let fileFrames = try segment.reader.frameCount()
+            // Clamped rather than trusted: the CPL is a description of the file
+            // and the two can disagree (a re-wrapped asset, a hand-edited
+            // reel). Playing past the end of the essence throws per frame,
+            // which reads as "this reel is broken" for a window that is merely
+            // a few frames long.
+            let entry = min(max(0, segment.entryPoint), max(0, fileFrames - 1))
+            let available = fileFrames - entry
+            let count = min(segment.duration ?? available, available)
             guard count > 0 else { continue }
-            built.append(Segment(reader: reader,
+            built.append(Segment(reader: segment.reader,
+                                 entryPoint: entry,
                                  localFrameCount: count,
                                  globalOffset: globalOffset))
             globalOffset += count
@@ -222,7 +279,7 @@ public actor DCPFrameSource {
         if let reduceLevel {
             self.reduceLevel = max(0, reduceLevel)
         } else if let first = built.first,
-                  let cs = try? first.reader.codestream(at: 0),
+                  let cs = try? first.reader.codestream(at: first.entryPoint),
                   let info = try? J2KCodestreamInfo(codestream: cs) {
             self.reduceLevel = info.previewReduceLevel(
                 sustainsFullResolution: Self.sustainsFullResolution(concurrency: concurrency,
@@ -428,7 +485,8 @@ public actor DCPFrameSource {
         guard let loc = map.locate(globalIndex) else {
             throw MXFPictureReader.ReaderError.frameOutOfRange(globalIndex)
         }
-        return try segments[loc.segment].reader.codestream(at: loc.local)
+        let segment = segments[loc.segment]
+        return try segment.reader.codestream(at: segment.entryPoint + loc.local)
     }
 
     /// Locates the segment owning a global frame index. Linear scan is fine —
