@@ -575,11 +575,28 @@ public struct DCPSMPTEExporter: FormatExporter {
             }
 
             for (blockIdx, block) in sub.textBlocks.enumerated() {
-                let vpos = formatDCPVPosition(effective.vertical, blockIndex: blockIdx, totalBlocks: sub.textBlocks.count, baseVPosition: baseVPosition, lineHeight: lineHeight)
-                let placement = DCPHorizontal.attributes(horizontal: effective.horizontal, alignment: effective.alignment)
+                // A line that arrived with its own position keeps it. DCP writes
+                // Vposition on EVERY <Text>, so an imported cue already knows
+                // where each of its lines belongs; recomputing them from the
+                // cue's anchor plus a fixed line height silently rewrote the
+                // file — lines authored 6 % apart were re-exported 7 % apart,
+                // this exporter's default, and the delivered package no longer
+                // matched what was authored. The reader has honoured per-line
+                // positions all along; this is the writer catching up.
+                //
+                // "From these settings" is the one mode where the dialog's
+                // layout is *meant* to replace what the lines carry, so it
+                // still stacks from the base by `lineHeight`.
+                let ownsLine = !placeFromSettings && block.verticalPosition != nil
+                let lineVertical = ownsLine ? block.verticalPosition! : effective.vertical
+                let lineHorizontal = (placeFromSettings ? nil : block.horizontalPosition) ?? effective.horizontal
+                let vpos = ownsLine
+                    ? formatDCPVPosition(lineVertical, blockIndex: 0, totalBlocks: 1, baseVPosition: baseVPosition, lineHeight: lineHeight)
+                    : formatDCPVPosition(effective.vertical, blockIndex: blockIdx, totalBlocks: sub.textBlocks.count, baseVPosition: baseVPosition, lineHeight: lineHeight)
+                let placement = DCPHorizontal.attributes(horizontal: lineHorizontal, alignment: effective.alignment)
                 let hposStr = String(format: "%.1f", placement.hposition)
                 let halignStr = placement.halign
-                let valignStr = formatSMPTEVAlign(effective.vertical)
+                let valignStr = formatSMPTEVAlign(lineVertical)
                 let plainText = block.segments.map { segment in
                     // Wrap the run in a <Font> when it carries styling or a
                     // colour of its own; without the colour attribute a coloured
