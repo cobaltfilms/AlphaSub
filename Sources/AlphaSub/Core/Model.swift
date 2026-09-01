@@ -408,6 +408,16 @@ public struct Subtitle: Codable, Identifiable, Equatable {
     // SDH: Speaker identification for deaf/hard-of-hearing captions
     public var speaker: String
 
+    /// The cue's `SpotNumber` as written in the DCP it came from — what a lab
+    /// calls the "subtitle region number" when it reports a problem with one.
+    /// `nil` for every cue that did not come from a DCP, and for older projects.
+    ///
+    /// Read-only provenance: the exporters keep numbering their output
+    /// sequentially from 1, because an imported set can have gaps and two
+    /// merged tracks can repeat a number, and a DCP with a duplicate
+    /// SpotNumber is invalid.
+    public var spotNumber: Int?
+
     /// On-screen time in wall-clock seconds.
     public var durationSeconds: Double {
         endTime.seconds - startTime.seconds
@@ -439,7 +449,8 @@ public struct Subtitle: Codable, Identifiable, Equatable {
         isNewScene: Bool = false,
         hasRevision: Bool = false,
         isAI: Bool = false,
-        speaker: String = ""
+        speaker: String = "",
+        spotNumber: Int? = nil
     ) {
         self.id = id
         self.startTime = startTime
@@ -456,6 +467,7 @@ public struct Subtitle: Codable, Identifiable, Equatable {
         self.hasRevision = hasRevision
         self.isAI = isAI
         self.speaker = speaker
+        self.spotNumber = spotNumber
     }
 
     /// Backward-compatible overload for code compiled before `isAI` was added.
@@ -499,6 +511,17 @@ public struct Subtitle: Codable, Identifiable, Equatable {
         textBlocks.map { $0.plainText }.joined(separator: "\n")
     }
 
+    /// True when the cue carries formatting of its own — italic, bold,
+    /// underline, strikethrough or a colour on any run — rather than simply
+    /// being drawn with the project's settings.
+    ///
+    /// The companion of `useCustomPosition`, and deliberately *derived* rather
+    /// than a stored flag: a cue's formatting IS its runs, so there is no state
+    /// that could disagree with them.
+    public var hasCustomFormatting: Bool {
+        textBlocks.contains { $0.segments.contains { !$0.style.isEmpty || $0.color != nil } }
+    }
+
     /// True when any segment carries an explicit (non-default) colour.
     public var hasColor: Bool {
         textBlocks.contains { $0.segments.contains { $0.color != nil } }
@@ -510,6 +533,7 @@ public struct Subtitle: Codable, Identifiable, Equatable {
         case id, startTime, endTime, textBlocks
         case verticalPosition, horizontalPosition, alignment, useCustomPosition
         case isForced, isMusic, isOffSpeech, isNewScene, hasRevision, isAI, speaker
+        case spotNumber
     }
 
     /// Tolerant decoder for forward/backward project compatibility.
@@ -539,6 +563,7 @@ public struct Subtitle: Codable, Identifiable, Equatable {
         hasRevision = try c.decodeIfPresent(Bool.self, forKey: .hasRevision) ?? false
         isAI = try c.decodeIfPresent(Bool.self, forKey: .isAI) ?? false
         speaker = try c.decodeIfPresent(String.self, forKey: .speaker) ?? ""
+        spotNumber = try c.decodeIfPresent(Int.self, forKey: .spotNumber)
     }
 }
 

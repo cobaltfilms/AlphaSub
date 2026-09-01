@@ -118,18 +118,24 @@ public struct DCPInterOpImporter: FormatImporter {
                 verticalPosition: position.vertical,
                 horizontalPosition: position.horizontal,
                 alignment: position.alignment,
-                useCustomPosition: position.hasCustomPosition
+                useCustomPosition: position.hasCustomPosition,
+                spotNumber: subElem.attribute(forName: "SpotNumber")?.stringValue.flatMap { Int($0) }
             ))
         }
 
-        return [Track(
+        var track = Track(
             name: title,
             language: LanguageCode(resolvedLanguage),
             subtitles: subtitles,
             formatOrigin: "dcp_interop",
             metadata: metadata,
             frameRate: opts.targetFrameRate ?? detectedRate ?? .fps24
-        )]
+        )
+        // Same as the SMPTE side: CineCanvas positions every <Text>, so the
+        // track's layout is whatever most cues share — not "every cue is
+        // custom". See LayoutConsensus.
+        LayoutConsensus.adoptMajorityAsTrackDefault(&track)
+        return [track]
     }
 
     // MARK: - Parsing
@@ -279,32 +285,18 @@ public struct DCPInterOpImporter: FormatImporter {
         return DCPHorizontal.placement(halign: ha, hposition: hp).0
     }
 
+    /// The styled runs of one `<Text>`, in document order. InterOp's
+    /// DCSubtitle spells the underline attribute `Underlined`, with the D.
     private static func parseInteropTextSegments(_ textElem: XMLElement,
                                                  baseStyle: TextStyle = [],
                                                  baseColor: TextColor? = nil) -> [TextSegment] {
-        var segments: [TextSegment] = []
-
-        for child in (textElem.children ?? []).compactMap({ $0 as? XMLElement }) {
-            let localName = resolveLocalName(child.name)
-            if localName == "Font" {
-                var style: TextStyle = baseStyle
-                if child.attribute(forName: "Italic")?.stringValue == "yes" { style.insert(.italic) }
-                if child.attribute(forName: "Weight")?.stringValue == "bold" { style.insert(.bold) }
-                // Colour was being dropped here too (#50).
-                let color = child.attribute(forName: "Color")?.stringValue
-                    .flatMap(DCPColor.textColor(fromHex:)) ?? baseColor
-                if let text = child.stringValue?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines), !text.isEmpty {
-                    segments.append(TextSegment(text: text, style: style, color: color))
-                }
-            }
+        let segments = DCPTextRuns.segments(in: textElem, baseStyle: baseStyle,
+                                            baseColor: baseColor,
+                                            underlineAttribute: "Underlined")
+        if segments.isEmpty, let text = textElem.stringValue?
+            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines), !text.isEmpty {
+            return [TextSegment(text: text, style: baseStyle, color: baseColor)]
         }
-
-        if segments.isEmpty {
-            if let text = textElem.stringValue?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines), !text.isEmpty {
-                segments.append(TextSegment(text: text, style: baseStyle, color: baseColor))
-            }
-        }
-
         return segments
     }
 
@@ -467,6 +459,7 @@ public struct DCPInterOpExporter: FormatExporter {
             return 8.0
         }()
         let lineHeight: Double = opts.lineHeight ?? 7.0
+        let placeFromSettings = DCPPositionSource(opts) == .settings
         // AspectAdjust: prefer track metadata (set via the DCP Subtitle
         // Settings sheet), else 1.00. Previously hardcoded to "1.00".
         let fontAspect = track.metadata["dcp_font_aspect"] ?? "1.00"
@@ -506,7 +499,24 @@ public struct DCPInterOpExporter: FormatExporter {
             let spotNum = index + 1
             let timeIn = formatInteropTime(sub.startTime)
             let timeOut = formatInteropTime(sub.endTime)
-            let effective = track.effectivePosition(for: sub)
+            // Where each cue's placement comes from.
+            //
+            // "As authored" defers to the cue: a custom position set in the
+            // editor, or one that came in with an imported file, wins — which
+            // is right for a track someone has spotted by hand.
+            //
+            // It is also why the V position in this dialog could look broken.
+            // A cue carrying `.percentage` ignores the dialog entirely, and the
+            // DCP Subtitle Settings sheet writes the track default as
+            // `.percentage` too — so once that sheet had been opened, the
+            // dialog's V position had no effect on anything, with nothing on
+            // screen to say so. "From these settings" is the way back: it
+            // replaces every cue's placement with the layout below.
+            let effective = placeFromSettings
+                ? (vertical: VerticalPosition.percentage(baseVPosition),
+                   horizontal: track.defaultHorizontalPosition,
+                   alignment: track.defaultAlignment)
+                : track.effectivePosition(for: sub)
 
             xml += """
 
@@ -520,11 +530,18 @@ public struct DCPInterOpExporter: FormatExporter {
                 let halign = placement.halign
                 let valign = formatInteropVAlign(effective.vertical)
                 let plainText = block.segments.map { segment in
-                    // Italics and per-run colour both ride on a wrapping <Font>;
-                    // the colour only needs writing when it differs from the
-                    // track default already set on the outer <Font> (#50).
+                    // Italics, weight, underline and per-run colour all ride on
+                    // a wrapping <Font>; the colour only needs writing when it
+                    // differs from the track default already set on the outer
+                    // <Font> (#50). InterOp's DCSubtitle schema allows the same
+                    // nested-Font-inside-Text mixed content ST 428-7 does, so a
+                    // single italicised word is legal here too.
                     var attrs = ""
                     if segment.style.contains(.italic) { attrs += " Italic=\"yes\"" }
+                    // Never write Weight="normal" on a run — the document <Font>
+                    // may be bold, and the run would silently cancel it.
+                    if segment.style.contains(.bold), fontWeight != "bold" { attrs += " Weight=\"bold\"" }
+                    if segment.style.contains(.underline) { attrs += " Underlined=\"yes\"" }
                     if let c = segment.color, DCPColor.hex(from: c) != fontColor.uppercased() {
                         attrs += " Color=\"\(DCPColor.hex(from: c))\""
                     }

@@ -244,7 +244,10 @@ public struct DCPSMPTEImporter: FormatImporter {
                 verticalPosition: parsedVertical,
                 horizontalPosition: parsedHpos,
                 alignment: parsedAlign,
-                useCustomPosition: hasPositionData
+                useCustomPosition: hasPositionData,
+                // Kept for display: a lab reports a problem by subtitle region
+                // number, and the number in the file is the one they mean.
+                spotNumber: subElem.attribute(forName: "SpotNumber")?.stringValue.flatMap { Int($0) }
             ))
         }
 
@@ -261,7 +264,7 @@ public struct DCPSMPTEImporter: FormatImporter {
             metadata["dcp_start_time"] = startStr.trimmingCharacters(in: .whitespacesAndNewlines)
         }
 
-        return [Track(
+        var track = Track(
             name: title,
             language: LanguageCode(language),
             subtitles: subtitles,
@@ -269,7 +272,14 @@ public struct DCPSMPTEImporter: FormatImporter {
             timecodeOffset: startTimeOffset,
             metadata: metadata,
             frameRate: opts.targetFrameRate ?? editRate
-        )]
+        )
+        // ST 428-7 states a position on every <Text> — that is the format, not
+        // a per-cue decision — so taking it literally marked all 2000 cues of a
+        // feature "custom" and left the track defaults meaningless. Adopt the
+        // layout most cues share as the track's, and leave custom set only on
+        // the cues that genuinely depart from it.
+        LayoutConsensus.adoptMajorityAsTrackDefault(&track)
+        return [track]
     }
 
     // MARK: - Parsing Helpers
@@ -357,37 +367,21 @@ public struct DCPSMPTEImporter: FormatImporter {
         return 8.0
     }
 
+    /// The styled runs of one `<Text>`, in document order.
+    ///
+    /// ST 428-7 spells the underline attribute `Underline`; InterOp spells the
+    /// same thing `Underlined`. See `DCPTextRuns` for why the bare text between
+    /// nested `<Font>` elements has to be walked rather than skipped.
     private static func parseDCPTextSegments(_ textElem: XMLElement,
                                              baseStyle: TextStyle = [],
                                              baseColor: TextColor? = nil) -> [TextSegment] {
-        var segments: [TextSegment] = []
-
-        for child in (textElem.children ?? []).compactMap({ $0 as? XMLElement }) {
-            let localName = resolveLocalName(child.name)
-            if localName == "Font" {
-                let isItalic = child.attribute(forName: "Italic")?.stringValue == "yes"
-                let isBold = child.attribute(forName: "Weight")?.stringValue == "bold"
-                var style: TextStyle = baseStyle
-                if isItalic { style.insert(.italic) }
-                if isBold { style.insert(.bold) }
-                // A per-run Color overrides whatever the enclosing Font set —
-                // this is how coloured speaker cues are written, and dropping it
-                // was why imported colours never showed anywhere (#50).
-                let color = child.attribute(forName: "Color")?.stringValue
-                    .flatMap(DCPColor.textColor(fromHex:)) ?? baseColor
-
-                if let text = child.stringValue?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines), !text.isEmpty {
-                    segments.append(TextSegment(text: text, style: style, color: color))
-                }
-            }
+        let segments = DCPTextRuns.segments(in: textElem, baseStyle: baseStyle,
+                                            baseColor: baseColor,
+                                            underlineAttribute: "Underline")
+        if segments.isEmpty, let text = textElem.stringValue?
+            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines), !text.isEmpty {
+            return [TextSegment(text: text, style: baseStyle, color: baseColor)]
         }
-
-        if segments.isEmpty {
-            if let text = textElem.stringValue?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines), !text.isEmpty {
-                segments.append(TextSegment(text: text, style: baseStyle, color: baseColor))
-            }
-        }
-
         return segments
     }
 
@@ -510,6 +504,7 @@ public struct DCPSMPTEExporter: FormatExporter {
             return 8.0
         }()
         let lineHeight: Double = opts.lineHeight ?? 7.0
+        let placeFromSettings = DCPPositionSource(opts) == .settings
 
         // The subtitle resource's Id and reel number. The package writer
         // passes the MXF asset UUID (dcp_resource_id) so the XML's Id equals
@@ -548,7 +543,24 @@ public struct DCPSMPTEExporter: FormatExporter {
             let spotNum = index + 1
             let timeIn = formatSMPTE428Time(sub.startTime)
             let timeOut = formatSMPTE428Time(sub.endTime)
-            let effective = track.effectivePosition(for: sub)
+            // Where each cue's placement comes from.
+            //
+            // "As authored" defers to the cue: a custom position set in the
+            // editor, or one that came in with an imported file, wins — which
+            // is right for a track someone has spotted by hand.
+            //
+            // It is also why the V position in this dialog could look broken.
+            // A cue carrying `.percentage` ignores the dialog entirely, and the
+            // DCP Subtitle Settings sheet writes the track default as
+            // `.percentage` too — so once that sheet had been opened, the
+            // dialog's V position had no effect on anything, with nothing on
+            // screen to say so. "From these settings" is the way back: it
+            // replaces every cue's placement with the layout below.
+            let effective = placeFromSettings
+                ? (vertical: VerticalPosition.percentage(baseVPosition),
+                   horizontal: track.defaultHorizontalPosition,
+                   alignment: track.defaultAlignment)
+                : track.effectivePosition(for: sub)
 
             if schemaVersion.supportsFadeTimes {
                 xml += """
@@ -569,13 +581,27 @@ public struct DCPSMPTEExporter: FormatExporter {
                 let halignStr = placement.halign
                 let valignStr = formatSMPTEVAlign(effective.vertical)
                 let plainText = block.segments.map { segment in
-                    // Wrap the run in a <Font> when it carries italics or a
+                    // Wrap the run in a <Font> when it carries styling or a
                     // colour of its own; without the colour attribute a coloured
                     // cue came back white on the next round trip (#50). The
                     // enclosing <Font> already sets the track's default colour,
                     // so only a *different* colour needs writing here.
+                    //
+                    // <Text> is mixed content in ST 428-7, so a nested <Font>
+                    // may wrap a single word — this is how one italicised word
+                    // reaches a projector. Weight and Underlined ride along with
+                    // Italic: the importer has always read all three per run, so
+                    // writing only Italic meant per-word bold survived an import
+                    // and then vanished on the next export.
                     var attrs = ""
                     if segment.style.contains(.italic) { attrs += " Italic=\"yes\"" }
+                    // Only ever *add* weight to a run: the document <Font> may
+                    // already be bold, and "normal" on a run would undo it.
+                    if segment.style.contains(.bold), fontWeight != "bold" { attrs += " Weight=\"bold\"" }
+                    // ST 428-7 spells this attribute "Underline"; InterOp's
+                    // DCSubtitle spells the same thing "Underlined". Verified in
+                    // DCDMSubtitle-2007/2010/2014.xsd and DCSubtitle.xsd.
+                    if segment.style.contains(.underline) { attrs += " Underline=\"yes\"" }
                     if let c = segment.color, DCPColor.hex(from: c) != fontColor.uppercased() {
                         attrs += " Color=\"\(DCPColor.hex(from: c))\""
                     }
@@ -823,17 +849,33 @@ private enum ISDCFDCNCTableSMPTE {
 /// One display line of a cue with its position fully resolved: the line's own
 /// position when the block carries one, the cue's otherwise.
 public struct DCPLinePosition: Equatable {
-    public var text: String
+    /// The line's styled runs. A projector draws one word of a line in italics
+    /// when the DCP wraps it in its own `<Font Italic="yes">`, so a line is a
+    /// list of runs rather than a string — flattening it to `plainText` here is
+    /// what made every imported italic, bold and coloured word render plain.
+    public var segments: [TextSegment]
     public var vertical: VerticalPosition
     public var horizontal: HorizontalPosition
     public var alignment: TextAlignment
 
-    public init(text: String, vertical: VerticalPosition,
+    /// The line's text with the styling dropped — for measuring, logging and
+    /// the emptiness checks that decide whether a line is worth drawing.
+    public var text: String { segments.map(\.text).joined() }
+
+    public init(segments: [TextSegment], vertical: VerticalPosition,
                 horizontal: HorizontalPosition, alignment: TextAlignment) {
-        self.text = text
+        self.segments = segments
         self.vertical = vertical
         self.horizontal = horizontal
         self.alignment = alignment
+    }
+
+    /// An unstyled line. Kept because most callers (and every test that only
+    /// cares about geometry) have nothing but a string.
+    public init(text: String, vertical: VerticalPosition,
+                horizontal: HorizontalPosition, alignment: TextAlignment) {
+        self.init(segments: [TextSegment(text: text, style: [])],
+                  vertical: vertical, horizontal: horizontal, alignment: alignment)
     }
 }
 
@@ -865,7 +907,17 @@ public enum DCPLineResolver {
     public static func lines(for cue: Subtitle, cuePosition: DCPResolvedPosition) -> [DCPLinePosition] {
         let blocks = cue.textBlocks
         guard blocks.contains(where: { $0.verticalPosition != nil || $0.horizontalPosition != nil }) else {
-            return [DCPLinePosition(text: cue.plainText,
+            // One line hung from the cue position, but still carrying its runs:
+            // the newline between blocks becomes an unstyled segment so the
+            // renderer lays the cue out exactly as it did when this was a
+            // single joined string.
+            var segments: [TextSegment] = []
+            for (i, block) in blocks.enumerated() {
+                if i > 0 { segments.append(TextSegment(text: "\n", style: [])) }
+                segments.append(contentsOf: block.segments)
+            }
+            if segments.isEmpty { segments = [TextSegment(text: cue.plainText, style: [])] }
+            return [DCPLinePosition(segments: segments,
                                     vertical: cuePosition.vertical,
                                     horizontal: cuePosition.horizontal,
                                     alignment: cuePosition.alignment)]
@@ -873,7 +925,7 @@ public enum DCPLineResolver {
         return blocks
             .filter { !$0.plainText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             .map { block in
-                DCPLinePosition(text: block.plainText,
+                DCPLinePosition(segments: block.segments,
                                 vertical: block.verticalPosition ?? cuePosition.vertical,
                                 horizontal: block.horizontalPosition ?? cuePosition.horizontal,
                                 alignment: cuePosition.alignment)
