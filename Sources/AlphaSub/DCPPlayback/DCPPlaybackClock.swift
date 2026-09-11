@@ -42,3 +42,60 @@ public struct DCPPlaybackClock: Sendable {
         return lo <= hi ? lo...hi : nil
     }
 }
+
+/// Tracks which frame the display loop believes is on screen, and whether a
+/// frame whose fetch came back empty should be asked for again.
+///
+/// The loop marks a frame as "handled" BEFORE the fetch, because the fetch is
+/// async and the marker is what stops every later tick re-requesting the same
+/// index. The cost is that a fetch which fails leaves the loop believing it has
+/// done its job while the screen still holds the PREVIOUS frame, and no later
+/// tick ever asks again. While the playhead keeps moving that self-heals within
+/// a frame or two — which is why dragging the playhead always looked right —
+/// but a parked playhead makes exactly one request, which is why stepping cue
+/// to cue with the arrow keys could sit on the previous picture indefinitely.
+///
+/// Pure, so the rule can be tested without a decoder: see DCPFramePresentationTests.
+public struct DCPFramePresentation: Sendable, Equatable {
+    /// The frame the loop has committed to; -1 means "nothing claimed".
+    public private(set) var current: Int = -1
+    private var retryFrame: Int = -1
+    private var retryCount: Int = 0
+
+    /// How many times one frame may be re-requested. A cancelled decode — the
+    /// normal outcome when a jump drops the work queued for the old position —
+    /// succeeds on the next attempt, so the retry is cheap; a genuinely
+    /// undecodable frame must not spin the loop at tick rate forever.
+    public static let maxRetries = 3
+
+    public init() {}
+
+    /// True when this tick should fetch `frame`.
+    public mutating func shouldFetch(_ frame: Int, force: Bool) -> Bool {
+        guard force || frame != current else { return false }
+        current = frame
+        return true
+    }
+
+    /// A fetch came back empty. Returns true if the frame was reopened, so the
+    /// next tick asks again.
+    public mutating func noteFailure(of frame: Int) -> Bool {
+        guard current == frame else { return false }   // a newer target owns it
+        if retryFrame != frame { retryFrame = frame; retryCount = 0 }
+        guard retryCount < Self.maxRetries else { return false }
+        retryCount += 1
+        current = -1
+        return true
+    }
+
+    /// A frame reached the screen.
+    public mutating func notePresented(_ frame: Int) {
+        if retryFrame == frame { retryFrame = -1; retryCount = 0 }
+    }
+
+    /// A new output layer needs a frame pushed into it regardless of position.
+    public mutating func invalidate() { current = -1 }
+
+    /// True while `frame` is still the frame the loop is waiting on.
+    public func isCurrent(_ frame: Int) -> Bool { current == frame }
+}

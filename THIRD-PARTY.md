@@ -21,15 +21,16 @@ These run as **separate helper processes**; none is linked into AlphaSUB.
 - Used for: DNxHD/DNxHR + ProRes 4444 XQ encode, MKV mux/import, mov_text,
   audio extraction.
 
-### Grok (`grk_decompress`) — AGPL-3.0
-- **Version:** v20.3.7, bundled **unmodified** (binary + dylib closure from the
+### Grok (`grk_decompress`, `grk_compress`) — AGPL-3.0
+- **Version:** v20.4.7, bundled **unmodified** (binary + dylib closure from the
   Homebrew `grokj2k` bottle).
 - **Complete corresponding source:**
-  <https://github.com/GrokImageCompression/grok> (tag `v20.3.7`).
+  <https://github.com/GrokImageCompression/grok> (tag `v20.4.7`).
 - **Bundling script:** [`scripts/build-grok.sh`](scripts/build-grok.sh).
 - **License text:** bundled at `Resources/grok/LICENSE-grok.txt`;
   AGPL-3.0 text at <https://www.gnu.org/licenses/agpl-3.0.txt>.
-- Used for: real-time JPEG2000 decode during DCP playback.
+- Used for: real-time JPEG2000 decode during DCP playback, and JPEG2000
+  encode when AlphaDCP makes a picture track from a video.
 - Its dylib closure (libtiff, libpng, libwebp/sharpyuv, liblcms2, liblzma,
   libzstd, libfmt, libjpeg) is under permissive/free licenses; sources for all
   of them are available from their upstream projects or `brew fetch --deps grokj2k`.

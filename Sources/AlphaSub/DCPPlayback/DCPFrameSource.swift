@@ -74,6 +74,36 @@ public struct ReelSegmentMap: Sendable {
 //     capped by a cancellation-aware semaphore at ~perf-core count and marked
 //     userInitiated so the Grok subprocess runs on the performance cores.
 
+// MARK: - Picture that is not a JPEG 2000 track file
+
+/// A reel's picture supplied as planar X'Y'Z' — the shape Grok decodes to — for
+/// picture that has no JPEG 2000 track file yet: a linked video, before the DCP
+/// is exported. Everything after the planes (colour, cache, display) is the same
+/// path as a track file's, so what plays is what the export will encode.
+public protocol DCPPlanarPictureProvider: Sendable {
+    /// Frames available, counted from the start of the file.
+    var frameCount: Int { get }
+    /// Planar X'Y'Z' for frame `index` of the file: the X plane, then Y, then
+    /// Z, one little-endian 16-bit sample per pixel with `precision`
+    /// significant bits.
+    func planarFrame(at index: Int) async throws -> DCPPlanarFrame
+}
+
+/// One frame from a `DCPPlanarPictureProvider`.
+public struct DCPPlanarFrame: Sendable {
+    public let width: Int
+    public let height: Int
+    public let precision: Int
+    public let planarData: Data
+
+    public init(width: Int, height: Int, precision: Int, planarData: Data) {
+        self.width = width
+        self.height = height
+        self.precision = precision
+        self.planarData = planarData
+    }
+}
+
 public actor DCPFrameSource {
 
     /// A display-ready frame: a BGRA8 pixel buffer at the (reduced) preview
@@ -88,7 +118,9 @@ public actor DCPFrameSource {
     /// owns its own FileHandle (one per MXF); segments are concatenated in
     /// global-frame-index order to form the full composition timeline.
     struct Segment {
-        let reader: MXFPictureReader
+        /// The track file, or nil when the picture comes from `provider`.
+        let reader: MXFPictureReader?
+        let provider: (any DCPPlanarPictureProvider)?
         /// First frame of the file this segment plays — the reel's EntryPoint.
         /// Non-zero whenever the CPL windows the essence, which is the normal
         /// case for a reel whose asset is longer than the reel.
@@ -107,7 +139,10 @@ public actor DCPFrameSource {
     /// concatenated whole MXFs put every later reel at the wrong time the
     /// moment one asset stopped matching its reel exactly.
     public struct PictureSegment: Sendable {
-        public let reader: MXFPictureReader
+        /// The track file, or nil for picture from `provider`.
+        public let reader: MXFPictureReader?
+        /// Picture with no track file yet — a linked video — or nil.
+        public let provider: (any DCPPlanarPictureProvider)?
         public let pictureKey: Data?
         /// First frame of the file to play. Clamped to the file on open.
         public let entryPoint: Int
@@ -118,7 +153,19 @@ public actor DCPFrameSource {
         public init(reader: MXFPictureReader, pictureKey: Data? = nil,
                     entryPoint: Int = 0, duration: Int? = nil) {
             self.reader = reader
+            self.provider = nil
             self.pictureKey = pictureKey
+            self.entryPoint = entryPoint
+            self.duration = duration
+        }
+
+        /// Picture from a provider — a linked video before export — windowed
+        /// by the reel exactly as a track file is.
+        public init(provider: any DCPPlanarPictureProvider,
+                    entryPoint: Int = 0, duration: Int? = nil) {
+            self.reader = nil
+            self.provider = provider
+            self.pictureKey = nil
             self.entryPoint = entryPoint
             self.duration = duration
         }
@@ -248,7 +295,14 @@ public actor DCPFrameSource {
         var built: [Segment] = []
         var globalOffset = 0
         for segment in segments {
-            let fileFrames = try segment.reader.frameCount()
+            let fileFrames: Int
+            if let reader = segment.reader {
+                fileFrames = try reader.frameCount()
+            } else if let provider = segment.provider {
+                fileFrames = provider.frameCount
+            } else {
+                continue
+            }
             // Clamped rather than trusted: the CPL is a description of the file
             // and the two can disagree (a re-wrapped asset, a hand-edited
             // reel). Playing past the end of the essence throws per frame,
@@ -259,6 +313,7 @@ public actor DCPFrameSource {
             let count = min(segment.duration ?? available, available)
             guard count > 0 else { continue }
             built.append(Segment(reader: segment.reader,
+                                 provider: segment.provider,
                                  entryPoint: entry,
                                  localFrameCount: count,
                                  globalOffset: globalOffset))
@@ -278,8 +333,12 @@ public actor DCPFrameSource {
         // decision rather than something the geometry has to guess at.
         if let reduceLevel {
             self.reduceLevel = max(0, reduceLevel)
-        } else if let first = built.first,
-                  let cs = try? first.reader.codestream(at: first.entryPoint),
+        } else if !built.contains(where: { $0.reader != nil }) {
+            // Provided picture arrives at its own size: there is no wavelet
+            // to decode at a lower level.
+            self.reduceLevel = 0
+        } else if let first = built.first(where: { $0.reader != nil }),
+                  let cs = try? first.reader?.codestream(at: first.entryPoint),
                   let info = try? J2KCodestreamInfo(codestream: cs) {
             self.reduceLevel = info.previewReduceLevel(
                 sustainsFullResolution: Self.sustainsFullResolution(concurrency: concurrency,
@@ -335,7 +394,11 @@ public actor DCPFrameSource {
         return sustained >= max(editRate, 1) * 1.5
     }
 
-    public var isAvailable: Bool { decoder.isAvailable }
+    /// Whether every frame can be produced: Grok is needed only when a
+    /// segment is a JPEG 2000 track file.
+    public var isAvailable: Bool {
+        decoder.isAvailable || !segments.contains { $0.reader != nil }
+    }
 
     public func frame(at index: Int) async throws -> DisplayFrame {
         if let hit = cache[index] {
@@ -445,7 +508,7 @@ public actor DCPFrameSource {
         let id = UUID()
         let task = Task<DisplayFrame, Error>.detached(priority: .userInitiated) { [weak self] in
             guard let self else { throw CancellationError() }
-            let codestream = try await self.readCodestream(at: index)
+            let work = try await self.work(at: index)
             try Task.checkCancellation()
             // A task cancelled while waiting on the gate resumes WITHOUT a
             // slot — bail before the matching release unbalances the count.
@@ -456,7 +519,19 @@ public actor DCPFrameSource {
             guard await gate.acquire() else { throw CancellationError() }
             defer { Task { await gate.release() } }
             try Task.checkCancellation()
-            let decoded = try decoder.decodeToPlanar(codestream, reduce: reduce)
+            let decoded: GrokDecoder.DecodedFrame
+            switch work {
+            case .codestream(let codestream):
+                decoded = try decoder.decodeToPlanar(codestream, reduce: reduce)
+            case .provided(let provider, let local):
+                // The same planes a decode yields, so the same conversion,
+                // cache and display follow.
+                let frame = try await provider.planarFrame(at: local)
+                decoded = GrokDecoder.DecodedFrame(
+                    info: J2KCodestreamInfo(width: frame.width, height: frame.height,
+                                            componentCount: 3, precision: frame.precision, rsiz: 0),
+                    planarData: frame.planarData)
+            }
             // Favour the GPU for the colour conversion; fall back to CPU.
             let pb: CVPixelBuffer
             if let gpu = MetalXYZConverter.shared, let parameters,
@@ -478,15 +553,28 @@ public actor DCPFrameSource {
         return task
     }
 
-    /// Maps a global frame index to its segment and reads the codestream from
-    /// that segment's reader. The actor isolation serialises FileHandle
-    /// access per reader (each reader has its own handle).
-    private func readCodestream(at globalIndex: Int) throws -> Data {
+    /// What a frame needs: a codestream to decode, or a provider to ask.
+    private enum Work: Sendable {
+        case codestream(Data)
+        case provided(any DCPPlanarPictureProvider, Int)
+    }
+
+    /// Maps a global frame index to its segment: reads the codestream from a
+    /// track file (actor isolation serialises each reader's FileHandle), or
+    /// names the provider and its frame for picture that has no track file.
+    private func work(at globalIndex: Int) throws -> Work {
         guard let loc = map.locate(globalIndex) else {
             throw MXFPictureReader.ReaderError.frameOutOfRange(globalIndex)
         }
         let segment = segments[loc.segment]
-        return try segment.reader.codestream(at: segment.entryPoint + loc.local)
+        let local = segment.entryPoint + loc.local
+        if let reader = segment.reader {
+            return .codestream(try reader.codestream(at: local))
+        }
+        guard let provider = segment.provider else {
+            throw MXFPictureReader.ReaderError.frameOutOfRange(globalIndex)
+        }
+        return .provided(provider, local)
     }
 
     /// Locates the segment owning a global frame index. Linear scan is fine —

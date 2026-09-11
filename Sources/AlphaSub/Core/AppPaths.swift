@@ -19,18 +19,28 @@ public enum AppPaths {
     }
 
     /// Candidate roots to search for bundled command-line tools (asdcp, grok,
-    /// ffmpeg). They ship in the AlphaSubToolBinaries resource bundle; the
-    /// legacy AlphaSubApp bundle name is kept as a fallback so a build staged by
-    /// an older packaging run still resolves.
+    /// ffmpeg).
+    ///
+    /// EVERY resource bundle in the app, not a list of names. SwiftPM names a
+    /// bundle `<Package>_<Target>`, so the rename of this package to
+    /// AlphaShared moved the tools from `AlphaSub_AlphaSubToolBinaries.bundle`
+    /// to `AlphaShared_AlphaSubToolBinaries.bundle` — and a hardcoded pair of
+    /// `AlphaSub_*` names went on resolving only because a stale bundle under
+    /// the old name was still lying in `.build` and being copied in beside the
+    /// real one. On a machine that got a package built from a clean tree the
+    /// decoder was simply not found, and DCP playback reported it as
+    /// unavailable while the binary sat in the app the whole time.
+    ///
+    /// Directory enumeration cannot go stale the way a name list does. The
+    /// explicit roots stay first so the common case is still a direct hit.
     public static var bundledToolRoots: [URL] {
         var roots: [URL] = []
         if let r = Bundle.main.resourceURL { roots.append(r) }
         roots.append(Bundle.main.bundleURL)
-        for name in ["AlphaSub_AlphaSubToolBinaries.bundle", "AlphaSub_AlphaSubApp.bundle"] {
-            roots.append(Bundle.main.bundleURL.appendingPathComponent(name))
-            if let r = Bundle.main.resourceURL {
-                roots.append(r.appendingPathComponent(name))
-            }
+        for container in [Bundle.main.resourceURL, Bundle.main.bundleURL].compactMap({ $0 }) {
+            let bundles = (try? FileManager.default.contentsOfDirectory(
+                at: container, includingPropertiesForKeys: nil)) ?? []
+            roots.append(contentsOf: bundles.filter { $0.pathExtension == "bundle" })
         }
         return roots
     }

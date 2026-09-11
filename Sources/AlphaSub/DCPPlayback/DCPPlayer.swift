@@ -87,11 +87,42 @@ public final class DCPPlayer: ObservableObject {
         loop?.removeLayer(layer)
     }
 
-    /// Hook every shown frame (e.g. to drive DeckLink SDI output). Set to nil
-    /// to stop. Called on the display queue with the display-resolution buffer.
-    public func setFrameHook(_ hook: (@Sendable (CVPixelBuffer) -> Void)?) {
+    /// Attaches a per-frame observer under `key`, replacing any previous one
+    /// with that key. Nil detaches. Called on the display queue with the
+    /// display-resolution buffer.
+    ///
+    /// Keys keep independent consumers — SDI output and the video scopes —
+    /// from evicting each other; the hook used to be a single slot, so turning
+    /// on one quietly turned off the other.
+    public func setFrameObserver(_ hook: (@Sendable (CVPixelBuffer) -> Void)?,
+                                 for key: String) {
         ensureLoop()
-        loop?.setFrameHook(hook)
+        frameObservers[key] = hook
+        loop?.setFrameObserver(hook, for: key)
+    }
+
+    /// The SDI route, which predates the keyed registry and is the reason it
+    /// exists.
+    public func setFrameHook(_ hook: (@Sendable (CVPixelBuffer) -> Void)?) {
+        setFrameObserver(hook, for: Self.sdiObserverKey)
+    }
+
+    public static let sdiObserverKey = "sdi"
+    public static let scopesObserverKey = "scopes"
+
+    /// Called with the presentation time (seconds) of each frame actually put
+    /// on screen, off the main thread.
+    ///
+    /// The follower relationship is otherwise one-way — the player reads
+    /// `externalClock` and shows whatever it can decode for that time — which
+    /// leaves the subtitle overlay, driven by the transport clock, changing at
+    /// the instant of a seek while the picture arrives a decode later. They are
+    /// then simply two different clocks, and on a jump or a fast scrub the
+    /// operator sees the cue for a frame that is not on screen yet. Reporting
+    /// what was actually shown lets the overlay be driven by the picture, so
+    /// the two change together.
+    public var onFramePresented: (@Sendable (Double) -> Void)? {
+        didSet { loop?.setPresentationObserver(onFramePresented) }
     }
 
     /// Change how the picture is converted while it is on screen.
@@ -110,11 +141,17 @@ public final class DCPPlayer: ObservableObject {
         }
     }
 
+    /// Observers survive a loop being torn down and rebuilt — a scope that
+    /// went blank when the clock was reattached would look like a scope bug.
+    private var frameObservers: [String: @Sendable (CVPixelBuffer) -> Void] = [:]
+
     private func ensureLoop() {
         guard loop == nil, let externalClock else { return }
         let l = DCPDisplayLoop(source: source, clock: clock,
                                hz: max(60, clock.fps * 2), clockSource: externalClock)
         loop = l
+        for (key, hook) in frameObservers { l.setFrameObserver(hook, for: key) }
+        l.setPresentationObserver(onFramePresented)
         l.start()
     }
 }

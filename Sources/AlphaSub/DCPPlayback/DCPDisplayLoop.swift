@@ -53,10 +53,15 @@ final class DCPDisplayLoop: @unchecked Sendable {
     /// Output layers — main video area, fullscreen, detached window — all fed
     /// the same frames. Mutated only on `queue`.
     private var layers: [AVSampleBufferDisplayLayer] = []
-    /// Optional per-frame hook (e.g. DeckLink SDI output) receiving the shown
-    /// pixel buffer. Called on `queue`, and — like `layers` — mutated only on
-    /// `queue`: `setFrameHook` hops, so nothing else may touch this directly.
-    private var onFrame: (@Sendable (CVPixelBuffer) -> Void)?
+    /// Per-frame observers (DeckLink SDI output, video scopes) receiving the
+    /// shown pixel buffer, keyed so they do not evict each other. Called on
+    /// `queue`, and — like `layers` — mutated only on `queue`:
+    /// `setFrameObserver` hops, so nothing else may touch this directly.
+    ///
+    /// It used to be a single slot, which meant turning on the scopes silently
+    /// turned off SDI output and vice versa: whichever attached last won, and
+    /// the other simply went quiet with nothing to say why.
+    private var observers: [String: @Sendable (CVPixelBuffer) -> Void] = [:]
 
     private let source: DCPFrameSource
     private let clock: DCPPlaybackClock
@@ -67,9 +72,18 @@ final class DCPDisplayLoop: @unchecked Sendable {
 
     private let queue = DispatchQueue(label: "com.alphasub.dcp.display", qos: .userInitiated)
     private var timer: DispatchSourceTimer?
-    private var lastFrame = -1
+    /// Which frame the loop has claimed, and the bounded retry for one whose
+    /// fetch came back empty. The rule is pure and lives in
+    /// `DCPFramePresentation` so it can be tested without a decoder.
+    private var presentation = DCPFramePresentation()
     private var lastPrefetchFrame = -1
     private let formatCache = FrameFormatCache()
+
+    /// Notified on `queue` with the presentation time of each frame actually
+    /// put on screen, so the subtitle overlay can be driven by the picture the
+    /// operator is looking at rather than by the transport clock. Mutated only
+    /// on `queue`, for the same reason `observers` is.
+    private var presentationObserver: (@Sendable (Double) -> Void)?
 
     init(source: DCPFrameSource,
          clock: DCPPlaybackClock,
@@ -85,7 +99,7 @@ final class DCPDisplayLoop: @unchecked Sendable {
         queue.async { [weak self] in
             guard let self, !self.layers.contains(where: { $0 === layer }) else { return }
             self.layers.append(layer)
-            self.lastFrame = -1   // force a fresh frame into the new layer
+            self.presentation.invalidate()   // force a fresh frame into the new layer
         }
     }
 
@@ -104,9 +118,17 @@ final class DCPDisplayLoop: @unchecked Sendable {
     /// straight across those two threads is a data race, and the way it shows
     /// up is the card going quiet: the loop keeps calling a hook that the
     /// other thread has already replaced, or reads a half-published one.
-    func setFrameHook(_ hook: (@Sendable (CVPixelBuffer) -> Void)?) {
+    func setFrameObserver(_ hook: (@Sendable (CVPixelBuffer) -> Void)?, for key: String) {
         queue.async { [weak self] in
-            self?.onFrame = hook
+            self?.observers[key] = hook
+        }
+    }
+
+    /// Install (or clear) the presentation hook. Hops to `queue` like every
+    /// other cross-thread mutation here.
+    func setPresentationObserver(_ hook: (@Sendable (Double) -> Void)?) {
+        queue.async { [weak self] in
+            self?.presentationObserver = hook
         }
     }
 
@@ -154,7 +176,8 @@ final class DCPDisplayLoop: @unchecked Sendable {
         // call — as two unordered Tasks the cancel can land after the arm and
         // kill the window it just queued.
         if frame != lastPrefetchFrame {
-            let jumped = lastFrame >= 0 && (frame < lastFrame - 4 || frame > lastFrame + 16)
+            let last = presentation.current
+            let jumped = last >= 0 && (frame < last - 4 || frame > last + 16)
             lastPrefetchFrame = frame
             let ahead = playing ? 16 : 6
             let behind = playing ? 2 : 6
@@ -164,19 +187,25 @@ final class DCPDisplayLoop: @unchecked Sendable {
             }
         }
 
-        guard force || frame != lastFrame else { return }
-        lastFrame = frame
+        guard presentation.shouldFetch(frame, force: force) else { return }
         Task { [weak self] in
             guard let self else { return }
             guard let f = try? await self.source.frame(at: frame) else {
-                if playing { self.counters.recordDropped() }
+                self.queue.async {
+                    if playing { self.counters.recordDropped() }
+                    // Nothing reached the screen, so the picture still shows
+                    // the PREVIOUS frame. Reopen this one for another attempt
+                    // unless the playhead has already moved on (a newer target
+                    // owns the marker now) or this frame has failed too often.
+                    _ = self.presentation.noteFailure(of: frame)
+                }
                 return
             }
             // The fetch is async; by the time it returns the playhead may have
             // moved on. Only present it if it's still the current frame — this
             // prevents an out-of-order stale frame flashing (a perceived drop).
             self.queue.async {
-                guard self.lastFrame == frame else {
+                guard self.presentation.isCurrent(frame) else {
                     // Decoded too late to be of use. While playing that is a
                     // genuine dropped frame; while scrubbing it is the loop
                     // discarding work the operator has already moved past, and
@@ -186,6 +215,11 @@ final class DCPDisplayLoop: @unchecked Sendable {
                 }
                 self.enqueue(f.pixelBuffer)
                 self.counters.recordPresented()
+                self.presentation.notePresented(frame)
+                // Announce the picture AFTER it has been handed to the layers,
+                // so a consumer that redraws in response (the subtitle
+                // overlay) is never ahead of the frame it belongs to.
+                self.presentationObserver?(self.clock.time(ofFrame: frame))
             }
         }
     }
@@ -213,9 +247,9 @@ final class DCPDisplayLoop: @unchecked Sendable {
                 }
             }
         }
-        // SDI hook runs AFTER the on-screen enqueue: a slow DeckLink feed must
-        // never delay the picture the operator is looking at.
-        onFrame?(pixelBuffer)
+        // Observers run AFTER the on-screen enqueue: a slow DeckLink feed or a
+        // scope raster must never delay the picture the operator is looking at.
+        for observer in observers.values { observer(pixelBuffer) }
     }
 }
 
