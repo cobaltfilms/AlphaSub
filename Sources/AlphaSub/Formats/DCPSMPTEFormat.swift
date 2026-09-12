@@ -188,7 +188,16 @@ public struct DCPSMPTEImporter: FormatImporter {
                 let linePct: Double
                 switch lineValign {
                 case "top":    linePct = 100.0 - vpos
-                case "center": linePct = 50.0
+                case "center":
+                    // ST 428-7 Table 6: the baseline's offset FROM the centre,
+                    // negative = above, positive = below — the opposite sense
+                    // to the model's. Absent, it is the attribute's own default
+                    // (0), not the 8 % bottom margin `parseVPosition` falls
+                    // back to. Reading every centre line as 50 dropped the
+                    // offset, so a raised or lowered line came back centred.
+                    let offset = textElem.attribute(forName: "Vposition")?.stringValue
+                        .flatMap(Double.init) ?? 0
+                    linePct = 50.0 - offset
                 default:       linePct = vpos
                 }
                 linePercents.append(max(0.0, min(100.0, linePct)))
@@ -759,9 +768,17 @@ public struct DCPSMPTEExporter: FormatExporter {
             }
             return String(format: "%.1f", baseVPosition)
         case .safeArea(.center):
-            return "50.0"
+            // ST 428-7 Table 6: with Valign="center", Vposition is the
+            // baseline's offset FROM the centre, positive = down. "50.0" put
+            // every line on the picture's bottom edge. Lines stack about the
+            // centre, the top one first (negative).
+            let offset = (Double(blockIndex) - Double(totalBlocks - 1) / 2) * lineHeight
+            return String(format: "%.1f", offset)
         case .safeArea(.top):
-            return String(format: "%.1f", 100.0 - baseVPosition)
+            // Valign="top" measures DOWN from the top edge (Table 6), so the
+            // margin is written as it is — "100 − margin" put a top cue at the
+            // bottom of the screen. Lines stack downward from the top one.
+            return String(format: "%.1f", baseVPosition + Double(blockIndex) * lineHeight)
         default:
             return String(format: "%.1f", baseVPosition)
         }

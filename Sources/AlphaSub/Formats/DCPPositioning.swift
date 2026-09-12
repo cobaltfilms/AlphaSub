@@ -105,7 +105,9 @@ public enum DCPVertical {
                                   baseVPosition: Double = 8.0) -> (valign: String, vposition: Double) {
         switch vertical {
         case .safeArea(.top):    return ("top", baseVPosition)
-        case .safeArea(.center): return ("center", 50.0)
+        // Centre-anchored Vposition is an offset FROM the centre (ST 428-7
+        // Table 6), so the centre itself is 0 — 50 is the bottom edge.
+        case .safeArea(.center): return ("center", 0.0)
         case .safeArea(.bottom): return ("bottom", baseVPosition)
         case .percentage(let pct):
             // Model 0 = bottom; DCP bottom-anchored Vposition counts up from
