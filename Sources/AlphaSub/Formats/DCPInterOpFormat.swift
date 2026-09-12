@@ -202,7 +202,11 @@ public struct DCPInterOpImporter: FormatImporter {
         // in model terms (0 = bottom edge) and take the lowest instead.
         var linePercents: [Double] = []
         for textElem in textElems {
-            let va = textElem.attribute(forName: "VAlign")?.stringValue?.lowercased() ?? "bottom"
+            // An absent VAlign is "center" — the CineCanvas default (TI
+            // Subtitle Specification 1.1 rev C, sheet 20), and what libdcp
+            // assumes. Reading it as "bottom" put a line that asked for 10 %
+            // below the centre at 10 % above the bottom edge.
+            let va = textElem.attribute(forName: "VAlign")?.stringValue?.lowercased() ?? "center"
             let vp = textElem.attribute(forName: "VPosition")?.stringValue.flatMap(Double.init)
             let ha = textElem.attribute(forName: "HAlign")?.stringValue?.lowercased()
             let hp = textElem.attribute(forName: "HPosition")?.stringValue.flatMap(Double.init)
@@ -221,14 +225,16 @@ public struct DCPInterOpImporter: FormatImporter {
             case "top":
                 if let vp { linePercents.append(min(100, max(0, 100.0 - vp))) }
                 else { vpos = .safeArea(.top) }
-            case "center":
+            case "bottom":
+                if let vp { linePercents.append(min(100, max(0, vp))) }
+            default: // "center", and anything unrecognised
+                // A positive VPosition shifts the centre DOWN (TI sheet 20;
+                // ST 428-7 Table 6 agrees). This read it as up.
                 if let vp, vp != 0 {
-                    linePercents.append(min(100, max(0, 50.0 + vp)))
+                    linePercents.append(min(100, max(0, 50.0 - vp)))
                 } else {
                     vpos = .safeArea(.center)
                 }
-            default: // bottom
-                if let vp { linePercents.append(min(100, max(0, vp))) }
             }
 
             // Only flag as custom when it deviates from the house default
@@ -260,19 +266,21 @@ public struct DCPInterOpImporter: FormatImporter {
         let va = textElem.attribute(forName: "VAlign")?.stringValue?.lowercased()
         let vp = textElem.attribute(forName: "VPosition")?.stringValue.flatMap(Double.init)
         guard va != nil || vp != nil else { return nil }
-        switch va ?? "bottom" {
+        // An absent VAlign is "center", and a positive centre VPosition moves
+        // the line DOWN — see `parseInteropPosition`.
+        switch va ?? "center" {
         case "top":
             return vp.map { .percentage(min(100, max(0, 100.0 - $0))) } ?? .safeArea(.top)
-        case "center":
-            if let vp, vp != 0 {
-                return .percentage(min(100, max(0, 50.0 + vp)))
-            }
-            return .safeArea(.center)
-        default: // bottom
+        case "bottom":
             if let vp {
                 return .percentage(min(100, max(0, vp)))
             }
             return .safeArea(.bottom)
+        default: // "center", and anything unrecognised
+            if let vp, vp != 0 {
+                return .percentage(min(100, max(0, 50.0 - vp)))
+            }
+            return .safeArea(.center)
         }
     }
 
@@ -624,9 +632,16 @@ public struct DCPInterOpExporter: FormatExporter {
             let vpos = base + Double(totalBlocks - 1 - blockIndex) * lineHeight
             return String(format: "%.1f", max(0.0, min(100.0, vpos)))
         case .safeArea(.center):
-            return "0.0"   // at the center anchor
+            // CineCanvas (TI sheet 20): a positive VPosition shifts the centre
+            // DOWN. Lines stack about the centre, the top one first
+            // (negative) — every line used to be written at 0, one on top of
+            // the other.
+            let offset = (Double(blockIndex) - Double(totalBlocks - 1) / 2) * lineHeight
+            return String(format: "%.1f", offset)
         case .safeArea(.top):
-            return String(format: "%.1f", baseVPosition)
+            // Measured down from the top edge; lines stack downward from the
+            // top one instead of all sharing its VPosition.
+            return String(format: "%.1f", baseVPosition + Double(blockIndex) * lineHeight)
         default: // bottom-anchored default, lines stacked upward
             if totalBlocks == 2 {
                 return String(format: "%.1f", blockIndex == 0 ? (baseVPosition + lineHeight) : baseVPosition)

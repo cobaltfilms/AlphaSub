@@ -133,20 +133,15 @@ public struct DCPSMPTEImporter: FormatImporter {
             // 100 = top), so the cue-level value below can pick the lowest
             // line regardless of which anchor each line declared.
             var linePercents: [Double] = []
-            var rawVpositions: [Double] = []
             var parsedHpos: HorizontalPosition = .centered
             var parsedAlign: TextAlignment = .center
             var parsedVertical: VerticalPosition = .safeArea(.bottom)
             var hasPositionData = false
-            var explicitValign: SafeAreaPosition? = nil
 
             // <Text> may be wrapped in <Font> elements inside <Subtitle> (the
             // standard way whole-cue italics are written) — walk the subtree
             // instead of only the direct children, inheriting the Font style.
             for (textElem, inheritedStyle, inheritedColor) in DCPTextTree.texts(in: subElem) {
-                let vpos = parseVPosition(textElem)
-                rawVpositions.append(vpos)
-
                 // Per-line position: ST 428-7 carries Vposition/Valign (and
                 // Hposition/Halign) on EVERY <Text>, and a player draws each
                 // line at its own position. Keep those on the block so the
@@ -168,41 +163,22 @@ public struct DCPSMPTEImporter: FormatImporter {
                     blockHorizontal = placement.0
                     hasPositionData = true
                 }
-                if let va = textElem.attribute(forName: "Valign")?.stringValue {
-                    switch va.lowercased() {
-                    case "top": explicitValign = .top
-                    case "center": explicitValign = .center
-                    default: explicitValign = .bottom
-                    }
+                if textElem.attribute(forName: "Valign") != nil {
                     hasPositionData = true
                 }
                 // A line only claims its own vertical position when the element
                 // actually carries Vposition or Valign; otherwise it defers to
-                // the cue's (nil). The anchor is THIS element's Valign only
-                // (absent = bottom, the spec default) — not whatever a sibling
-                // line declared. Same conversion as the cue-level resolve
-                // below: model percentage is 0 = bottom, 100 = top.
+                // the cue's (nil). Either way its position follows ST 428-7
+                // §6.3.3–6.3.4 — an absent Valign is "center", an absent
+                // Vposition is 0 — the defaults libdcp applies too. Reading an
+                // absent Valign as "bottom" put a line that asked for 10 %
+                // below the centre at 10 % above the bottom edge.
                 let lineValign = textElem.attribute(forName: "Valign")?.stringValue?.lowercased()
-                let hasOwnV = textElem.attribute(forName: "Vposition")?.stringValue != nil
-                    || lineValign != nil
-                let linePct: Double
-                switch lineValign {
-                case "top":    linePct = 100.0 - vpos
-                case "center":
-                    // ST 428-7 Table 6: the baseline's offset FROM the centre,
-                    // negative = above, positive = below — the opposite sense
-                    // to the model's. Absent, it is the attribute's own default
-                    // (0), not the 8 % bottom margin `parseVPosition` falls
-                    // back to. Reading every centre line as 50 dropped the
-                    // offset, so a raised or lowered line came back centred.
-                    let offset = textElem.attribute(forName: "Vposition")?.stringValue
-                        .flatMap(Double.init) ?? 0
-                    linePct = 50.0 - offset
-                default:       linePct = vpos
-                }
-                linePercents.append(max(0.0, min(100.0, linePct)))
-                if hasOwnV {
-                    blockVertical = .percentage(max(0.0, min(100.0, linePct)))
+                let lineVposition = textElem.attribute(forName: "Vposition")?.stringValue.flatMap(Double.init)
+                let linePct = Self.modelPercent(valign: lineValign, vposition: lineVposition)
+                linePercents.append(linePct)
+                if lineVposition != nil || lineValign != nil {
+                    blockVertical = .percentage(linePct)
                 }
 
                 let segments = parseDCPTextSegments(textElem,
@@ -230,20 +206,12 @@ public struct DCPSMPTEImporter: FormatImporter {
             // `Valign="bottom"` lines still resolves to whichever sits lowest
             // on screen, not whichever has the smaller raw number.
             //
-            // The per-line normalisation is also why no second switch on the
-            // cue's `explicitValign` is needed here: that variable only ever
-            // held the LAST line's anchor, and each line has already been
-            // converted through its own.
-            let bottomPct = linePercents.min() ?? 8.0
-            if explicitValign != nil {
-                parsedVertical = .percentage(max(0.0, min(100.0, bottomPct)))
-            } else if hasPositionData {
-                // Has Hposition/Halign but no Valign — use safeArea default.
-                parsedVertical = .safeArea(.bottom)
-            } else if (rawVpositions.min() ?? 8.0) > 10.0 {
+            // Every line has a position — the one it states, or ST 428-7's
+            // defaults (center, 0) — so the cue always resolves from its
+            // lines. The fallbacks this replaced guessed "bottom" whenever
+            // Valign was missing, the one reading the standard rules out.
+            if let bottomPct = linePercents.min() {
                 parsedVertical = .percentage(bottomPct)
-            } else {
-                parsedVertical = .safeArea(.bottom)
             }
 
             subtitles.append(Subtitle(
@@ -370,10 +338,20 @@ public struct DCPSMPTEImporter: FormatImporter {
         return Timecode(h: h, m: m, s: sec, f: f, frameRate: frameRate)
     }
 
-    private static func parseVPosition(_ textElem: XMLElement) -> Double {
-        if let vposStr = textElem.attribute(forName: "Vposition")?.stringValue,
-           let vpos = Double(vposStr) { return vpos }
-        return 8.0
+    /// A `<Text>` line's vertical position in the model's terms (percent up
+    /// from the bottom edge), per ST 428-7 Table 6 and its defaults: an absent
+    /// Valign is "center" and an absent Vposition 0. "top" counts DOWN from the
+    /// top edge, "bottom" UP from the bottom edge, and "center" is an offset
+    /// from the centre with positive = down.
+    static func modelPercent(valign: String?, vposition: Double?) -> Double {
+        let v = vposition ?? 0
+        let pct: Double
+        switch valign ?? "center" {
+        case "top":    pct = 100.0 - v
+        case "bottom": pct = v
+        default:       pct = 50.0 - v      // "center", and anything unrecognised
+        }
+        return max(0.0, min(100.0, pct))
     }
 
     /// The styled runs of one `<Text>`, in document order.

@@ -109,32 +109,59 @@ public enum FontSubsetter {
             }
         }
 
-        let oldGIDs = keep.sorted()
+        // Glyph order. RP 428-22 Table 1 wants the first four glyphs to be
+        // .notdef, .null (U+0000), CR (U+000D) and space — the classic
+        // TrueType layout (ISO/IEC 14496-22 §7.6). Sorting the kept IDs gave
+        // .notdef followed by whatever the text used, so a subset font had no
+        // .null or CR at all. Those two are written as empty glyphs of our
+        // own rather than trusting the source's glyphs 1 and 2, which a
+        // modern font need not reserve; the space is the source's own.
+        let spaceGID = keptChars[0x20]
+        let rest = keep.subtracting([0]).subtracting(spaceGID.map { [$0] } ?? []).sorted()
+        let slots: [GlyphSlot] = [.source(0), .empty, .empty, spaceGID.map(GlyphSlot.source) ?? .empty]
+            + rest.map(GlyphSlot.source)
         var newGID: [UInt16: UInt16] = [:]
-        for (new, old) in oldGIDs.enumerated() { newGID[old] = UInt16(new) }
+        for (new, slot) in slots.enumerated() {
+            if case .source(let old) = slot { newGID[old] = UInt16(new) }
+        }
 
         // Rebuild glyf + loca (long format), remapping composite references.
+        // An empty glyph is a zero-length entry: two equal loca offsets.
         var glyf = Data()
         var loca = Data()
         loca.appendUInt32(0)
-        for old in oldGIDs {
-            var glyphBytes = try font.glyphData(ofGlyph: old)
-            try Self.remapCompositeReferences(in: &glyphBytes, using: newGID)
-            glyf.append(glyphBytes)
-            while glyf.count % 4 != 0 { glyf.append(0) }   // 4-align entries
+        for slot in slots {
+            if case .source(let old) = slot {
+                var glyphBytes = try font.glyphData(ofGlyph: old)
+                try Self.remapCompositeReferences(in: &glyphBytes, using: newGID)
+                glyf.append(glyphBytes)
+                while glyf.count % 4 != 0 { glyf.append(0) }   // 4-align entries
+            }
             loca.appendUInt32(UInt32(glyf.count))
         }
 
-        // Rebuild hmtx with full metrics for every kept glyph.
+        // Rebuild hmtx with full metrics for every glyph. .null has no
+        // advance; CR takes the space's, as the classic "nonmarkingreturn" does.
+        let spaceAdvance = spaceGID.map { font.horizontalMetrics(ofGlyph: $0).advance } ?? 0
         var hmtx = Data()
-        for old in oldGIDs {
-            let (advance, lsb) = font.horizontalMetrics(ofGlyph: old)
-            hmtx.appendUInt16(advance)
-            hmtx.appendInt16(lsb)
+        for (index, slot) in slots.enumerated() {
+            switch slot {
+            case .source(let old):
+                let (advance, lsb) = font.horizontalMetrics(ofGlyph: old)
+                hmtx.appendUInt16(advance)
+                hmtx.appendInt16(lsb)
+            case .empty:
+                hmtx.appendUInt16(index == 2 ? spaceAdvance : 0)
+                hmtx.appendInt16(0)
+            }
         }
 
-        // Rebuild cmap: single (3,1) format-4 subtable over the kept chars.
-        let cmap = Self.buildCmapFormat4(mapping: keptChars.mapValues { newGID[$0]! })
+        // Rebuild cmap: single (3,1) format-4 subtable over the kept chars,
+        // plus U+0000 → .null and U+000D → CR.
+        var mapping = keptChars.mapValues { newGID[$0]! }
+        mapping[0x0000] = 1
+        mapping[0x000D] = 2
+        let cmap = Self.buildCmapFormat4(mapping: mapping)
 
         // Patch fixed tables.
         var head = font.table("head")!
@@ -142,10 +169,10 @@ public enum FontSubsetter {
         head.replaceUInt32(at: 8, with: 0)             // checkSumAdjustment, recomputed below
 
         var hhea = font.table("hhea")!
-        hhea.replaceUInt16(at: 34, with: UInt16(oldGIDs.count))  // numberOfHMetrics
+        hhea.replaceUInt16(at: 34, with: UInt16(slots.count))  // numberOfHMetrics
 
         var maxp = font.table("maxp")!
-        maxp.replaceUInt16(at: 4, with: UInt16(oldGIDs.count))   // numGlyphs
+        maxp.replaceUInt16(at: 4, with: UInt16(slots.count))   // numGlyphs
 
         // post v3.0: keep the 32-byte header, no glyph names.
         var post = font.table("post") ?? Data(count: 32)
@@ -172,6 +199,23 @@ public enum FontSubsetter {
 
         try Self.validate(output, characters: keptChars.keys)
         return output
+    }
+
+    /// One glyph of a subset font: a glyph copied from the source, or an
+    /// empty one supplied here (the .null and CR RP 428-22 requires).
+    private enum GlyphSlot {
+        case source(UInt16)
+        case empty
+    }
+
+    /// A font's character → glyph map, for tests.
+    static func glyphMapping(fontData: Data) throws -> [UInt16: UInt16] {
+        try SFNTFont(data: fontData).cmap
+    }
+
+    /// The byte length of one glyph's outline (0 for an empty glyph), for tests.
+    static func glyphByteCount(fontData: Data, glyph: UInt16) throws -> Int {
+        try SFNTFont(data: fontData).glyphData(ofGlyph: glyph).count
     }
 
     // MARK: - Composite remapping
