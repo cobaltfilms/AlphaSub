@@ -317,6 +317,25 @@ public struct Timecode: Codable, Equatable, Comparable, Hashable {
         return Timecode(totalFrames: frames, frameRate: frameRate)
     }
 
+    /// The fewest whole frames that last at least `seconds` at `frameRate`.
+    ///
+    /// A duration limit is stated in seconds and met in frames, and the two
+    /// directions round differently: a *minimum* is only met by rounding up.
+    /// Going through `fromSeconds`, which floors, gave a cue "extended to the
+    /// minimum" one frame too few at every rate where the product is not a
+    /// whole number — 5/6 s at 25 fps is 20.83 frames, floored to 20, which is
+    /// 0.8 s and still too short — and at exact rates too whenever the start
+    /// time's own seconds value sat a hair below its frame.
+    public static func framesCovering(_ seconds: Double, frameRate: FrameRate) -> Int64 {
+        Int64((seconds * frameRate.value - 1e-6).rounded(.up))
+    }
+
+    /// The most whole frames that last no more than `seconds` at `frameRate`:
+    /// a *maximum* is only met by rounding down.
+    public static func framesWithin(_ seconds: Double, frameRate: FrameRate) -> Int64 {
+        Int64((seconds * frameRate.value + 1e-6).rounded(.down))
+    }
+
     /// Duration as string "00:00:03:12" or millisecond variant.
     public var durationString: String { smpteString }
 
@@ -1523,7 +1542,12 @@ public struct SubtitleDocument: Codable {
                     if replaced != original {
                         totalReplacements += 1
                         changed = true
-                        newBlocks.append(TextBlock(plainText: replaced))
+                        // Line by line, through InlineStyling: the words that
+                        // were not replaced keep their italics and colour, and
+                        // the line keeps its language and its own position.
+                        // (A replacement containing a line break yields the
+                        // extra lines as blocks, never a block with "\n".)
+                        newBlocks.append(contentsOf: InlineStyling.applyRewrittenText(replaced, to: [block]))
                     } else {
                         newBlocks.append(block)
                     }

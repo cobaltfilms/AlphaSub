@@ -277,22 +277,43 @@ public struct SRTImporter: FormatImporter {
     }
 
     /// Parse SRT text with <i>/<b>/<u>/<font> tags into TextBlocks.
+    ///
+    /// Style state carries from one line of a cue to the next: many tools (and
+    /// AlphaSUB before 1.6.22, issue #75) write `<i>line 1\nline 2</i>`, which
+    /// means both lines are italic. A tag still open at the end of the cue is
+    /// simply dropped.
     private static func parseSRTText(_ lines: [String]) -> [TextBlock] {
+        var state = SRTInlineState()
         return lines.map { line in
-            let segments = parseSRTLineIntoTextSegments(line)
+            let segments = parseSRTLineIntoTextSegments(line, state: &state)
             return TextBlock(segments: segments)
         }
     }
 
-    /// Parse a single line for HTML-like SRT style tags.
+    /// The inline style open at a point in a cue.
+    private struct SRTInlineState {
+        var style: TextStyle = []
+        var color: TextColor?
+        var colorStack: [TextColor?] = []
+    }
+
+    /// Parse a single line on its own (no style carried in).
     private static func parseSRTLineIntoTextSegments(_ line: String) -> [TextSegment] {
-        // Simple state machine: start with no style, toggle on <i>/<b>/<u>;
-        // <font color> pushes a colour, </font> pops back to the outer one.
+        var state = SRTInlineState()
+        return parseSRTLineIntoTextSegments(line, state: &state)
+    }
+
+    /// Parse a single line for HTML-like SRT style tags.
+    private static func parseSRTLineIntoTextSegments(_ line: String, state: inout SRTInlineState) -> [TextSegment] {
+        // Simple state machine: start with the style left open by the previous
+        // line, toggle on <i>/<b>/<u>; <font color> pushes a colour, </font>
+        // pops back to the outer one.
         var segments: [TextSegment] = []
         var currentText = ""
-        var currentStyle: TextStyle = []
-        var currentColor: TextColor?
-        var colorStack: [TextColor?] = []
+        var currentStyle: TextStyle = state.style
+        var currentColor: TextColor? = state.color
+        var colorStack: [TextColor?] = state.colorStack
+        defer { state = SRTInlineState(style: currentStyle, color: currentColor, colorStack: colorStack) }
         var i = line.startIndex
 
         while i < line.endIndex {
@@ -534,15 +555,26 @@ public struct SRTExporter: FormatExporter {
 
     /// Format TextBlocks into SRT lines with <i>/<b> markup.
     private static func formatSRTText(_ blocks: [TextBlock], sdhMode: Bool = false, subtitle: Subtitle? = nil) -> String {
+        // Tags never span a line break (issue #75): a segment whose text holds
+        // a newline is tagged line by line, so `<i>a\nb</i>` is written as
+        // `<i>a</i>\n<i>b</i>` — what other tools, and readers that parse SRT
+        // one line at a time, expect.
+        func tagged(_ text: String, _ segment: TextSegment) -> String {
+            guard !text.isEmpty else { return text }
+            var text = text
+            if segment.style.contains(.bold)      { text = "<b>\(text)</b>" }
+            if segment.style.contains(.italic)    { text = "<i>\(text)</i>" }
+            if segment.style.contains(.underline) { text = "<u>\(text)</u>" }
+            if segment.style.contains(.strikethrough) { text = "<s>\(text)</s>" }
+            if let color = segment.color { text = "<font color=\"\(color.hexString)\">\(text)</font>" }
+            return text
+        }
         return blocks.map { block in
             block.segments.map { segment in
-                var text = segment.text
-                if segment.style.contains(.bold)      { text = "<b>\(text)</b>" }
-                if segment.style.contains(.italic)    { text = "<i>\(text)</i>" }
-                if segment.style.contains(.underline) { text = "<u>\(text)</u>" }
-                if segment.style.contains(.strikethrough) { text = "<s>\(text)</s>" }
-                if let color = segment.color { text = "<font color=\"\(color.hexString)\">\(text)</font>" }
-                return text
+                segment.text
+                    .components(separatedBy: "\n")
+                    .map { tagged($0, segment) }
+                    .joined(separator: "\n")
             }.joined()
         }.joined(separator: "\n")
     }

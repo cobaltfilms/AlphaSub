@@ -40,7 +40,13 @@ public enum AppPaths {
         for container in [Bundle.main.resourceURL, Bundle.main.bundleURL].compactMap({ $0 }) {
             let bundles = (try? FileManager.default.contentsOfDirectory(
                 at: container, includingPropertiesForKeys: nil)) ?? []
-            roots.append(contentsOf: bundles.filter { $0.pathExtension == "bundle" })
+            for bundle in bundles where bundle.pathExtension == "bundle" {
+                roots.append(bundle)
+                // A resource bundle built as a real macOS bundle (the debug
+                // app run-dcp.sh assembles) keeps its files one level down.
+                // Missing it hid asdcp-unwrap and asdcp-info from QC there.
+                roots.append(bundle.appendingPathComponent("Contents/Resources", isDirectory: true))
+            }
         }
         return roots
     }

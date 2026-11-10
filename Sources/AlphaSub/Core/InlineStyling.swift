@@ -204,6 +204,156 @@ public enum InlineStyling {
         return rebuild(chars, like: blocks)
     }
 
+    // MARK: - Rewriting by a tool
+
+    /// Replace the cue's text with `newText` when the change may be anywhere
+    /// and in several places at once — what a tool does, as opposed to typing.
+    ///
+    /// A re-wrap moves every line break; a typography or spelling pass edits
+    /// wherever it finds something. `applyPlainText` would treat everything
+    /// between the first and the last change as one replacement and give it a
+    /// single style, which is how a re-wrapped cue used to lose its italics.
+    /// This aligns the two texts character by character instead:
+    ///
+    /// * a character that survives keeps its own style and colour;
+    /// * text that *replaces* something takes the style of what it replaces
+    ///   (a corrected word stays italic);
+    /// * other inserted text inherits the character before it, as typing does;
+    /// * inserted whitespace between two differently styled characters is
+    ///   unstyled, so a run never creeps across the gap a re-wrap just closed.
+    ///
+    /// The result is one `TextBlock` per display line. With the same number of
+    /// lines each keeps its language and its own position. When the number of
+    /// lines changes, a language shared by every line carries to the new ones,
+    /// and individually positioned lines (a DCP import) are re-stacked: the
+    /// line the stack hangs from stays where it was (the last for a cue in the
+    /// lower half of the picture, the first for one in the upper half, the
+    /// middle for one centred) and the others step away from it by the
+    /// spacing the cue already uses, or by `lineSpacing` when the cue had a
+    /// single line and so no spacing of its own (pass the track's, from
+    /// `LayoutConsensus.lineSpacing(of:)`). With no spacing to go by, the
+    /// per-line positions are dropped and the lines hang together from the
+    /// cue's position — a half-positioned stack would overlap.
+    public static func applyRewrittenText(_ newText: String, to blocks: [TextBlock],
+                                          lineSpacing: Double? = nil) -> [TextBlock] {
+        let old = flatten(blocks)
+        let new = Array(newText)
+        let oldChars = old.map(\.ch)
+        guard oldChars != new else { return blocks }
+
+        var removed = Set<Int>(), inserted = Set<Int>()
+        for change in new.difference(from: oldChars) {
+            switch change {
+            case .remove(let offset, _, _): removed.insert(offset)
+            case .insert(let offset, _, _): inserted.insert(offset)
+            }
+        }
+
+        // Walk the edit script in order. `replaced` is the style of the first
+        // real character removed since the last surviving one: what an
+        // insertion at this point is standing in for.
+        var attrs: [Attr?] = []
+        attrs.reserveCapacity(new.count)
+        var replaced: Attr?
+        var oi = 0
+        for ni in new.indices {
+            while removed.contains(oi) {
+                if replaced == nil, old[oi].ch != "\n", !old[oi].ch.isWhitespace { replaced = old[oi].attr }
+                oi += 1
+            }
+            if inserted.contains(ni) {
+                attrs.append(new[ni].isWhitespace ? nil : replaced)
+            } else {
+                attrs.append(old[oi].attr)
+                oi += 1
+                replaced = nil
+            }
+        }
+
+        return rebuild(resolved(new, attrs), like: blocks, restackingWith: .some(lineSpacing))
+    }
+
+    /// Divide a cue among `texts`, consecutive pieces of its own text — the
+    /// speakers of a dialogue cue being split into one cue each.
+    ///
+    /// Each piece takes its characters' styling from the original *in order*:
+    /// the second piece starts looking where the first one stopped. Aligning
+    /// every piece against the whole cue instead would let two speakers who say
+    /// the same word share the styling of whichever said it first. Characters
+    /// the pieces leave out (the dialogue dashes) are simply skipped.
+    public static func dividing(_ blocks: [TextBlock], into texts: [String],
+                                lineSpacing: Double? = nil) -> [[TextBlock]] {
+        let old = flatten(blocks)
+        var cursor = 0
+        return texts.map { text in
+            let new = Array(text)
+            var attrs: [Attr?] = []
+            attrs.reserveCapacity(new.count)
+            for ch in new {
+                guard !ch.isWhitespace,
+                      let found = old[cursor...].firstIndex(where: { $0.ch == ch })
+                else { attrs.append(nil); continue }
+                attrs.append(old[found].attr)
+                cursor = found + 1
+            }
+            return rebuild(resolved(new, attrs), like: blocks, restackingWith: .some(lineSpacing))
+        }
+    }
+
+    /// Give every character an `Attr`: its own when known, otherwise from its
+    /// neighbours — the character before it, as typing does; unstyled for
+    /// whitespace that sits between two differently styled characters.
+    private static func resolved(_ new: [Character], _ attrs: [Attr?]) -> [(ch: Character, attr: Attr)] {
+        var chars: [(ch: Character, attr: Attr)] = []
+        chars.reserveCapacity(new.count)
+        for (i, ch) in new.enumerated() {
+            if let attr = attrs[i] { chars.append((ch, attr)); continue }
+            let before = chars.last(where: { $0.ch != "\n" })?.attr
+            let after = new.indices[(i + 1)...]
+                .first(where: { new[$0] != "\n" && attrs[$0] != nil })
+                .flatMap { attrs[$0] }
+            if ch.isWhitespace {
+                chars.append((ch, before == after ? (before ?? Attr()) : Attr()))
+            } else {
+                chars.append((ch, before ?? after ?? Attr()))
+            }
+        }
+        return chars
+    }
+
+    /// Replace the cue's text wholesale — a translation — where the new words
+    /// have no character-level relation to the old ones.
+    ///
+    /// Styling is carried only where that is unambiguous: a cue that was
+    /// uniformly styled stays so, and when the number of lines is unchanged
+    /// each uniformly styled line keeps its own (an italic line over a plain
+    /// one). One italic word among plain ones cannot be mapped onto different
+    /// words, and guessing would italicise the wrong one, so mixed styling is
+    /// dropped. Lines, languages and positions follow `applyRewrittenText`.
+    public static func applyReplacementText(_ newText: String, to blocks: [TextBlock],
+                                            lineSpacing: Double? = nil) -> [TextBlock] {
+        func uniform(_ block: [TextBlock]) -> Attr? {
+            let visible = flatten(block).filter { !$0.ch.isWhitespace }
+            guard let first = visible.first?.attr else { return Attr() }
+            return visible.allSatisfy { $0.attr == first } ? first : nil
+        }
+        let newLines = newText.components(separatedBy: "\n")
+        let perLine: [Attr]
+        if let whole = uniform(blocks) {
+            perLine = Array(repeating: whole, count: newLines.count)
+        } else if newLines.count == blocks.count {
+            perLine = blocks.map { uniform([$0]) ?? Attr() }
+        } else {
+            perLine = Array(repeating: Attr(), count: newLines.count)
+        }
+        var chars: [(ch: Character, attr: Attr)] = []
+        for (index, line) in newLines.enumerated() {
+            if index > 0 { chars.append(("\n", Attr())) }
+            for ch in line { chars.append((ch, perLine[index])) }
+        }
+        return rebuild(chars, like: blocks, restackingWith: .some(lineSpacing))
+    }
+
     // MARK: - Flatten / rebuild
 
     private static func flatten(_ blocks: [TextBlock]) -> [(ch: Character, attr: Attr)] {
@@ -222,28 +372,92 @@ public enum InlineStyling {
     /// language and per-line position from the block that was at that index.
     /// Lines beyond the original count carry none — the same as a cue whose
     /// text was typed from scratch.
+    ///
+    /// `restackingWith` is for tools, which change the number of lines on
+    /// purpose: `nil` keeps the by-index rule above (typing); `.some(spacing)`
+    /// re-derives per-line attributes when the line count changes, as
+    /// `applyRewrittenText` describes.
     private static func rebuild(_ chars: [(ch: Character, attr: Attr)],
-                                like template: [TextBlock]) -> [TextBlock] {
+                                like template: [TextBlock],
+                                restackingWith restack: Double?? = nil) -> [TextBlock] {
         var lines: [[(ch: Character, attr: Attr)]] = [[]]
         for c in chars {
             if c.ch == "\n" { lines.append([]) } else { lines[lines.count - 1].append(c) }
         }
+        if let spacing = restack, lines.count != template.count, !template.isEmpty {
+            return restacked(lines, like: template, lineSpacing: spacing)
+        }
         return lines.enumerated().map { (index, line) in
-            var segments: [TextSegment] = []
-            for c in line {
-                if var last = segments.last, last.style == c.attr.style, last.color == c.attr.color {
-                    last.text.append(c.ch)
-                    segments[segments.count - 1] = last
-                } else {
-                    segments.append(TextSegment(text: String(c.ch), style: c.attr.style, color: c.attr.color))
-                }
-            }
-            if segments.isEmpty { segments = [TextSegment(text: "", style: [])] }
             let source = index < template.count ? template[index] : nil
-            return TextBlock(segments: segments,
+            return TextBlock(segments: segments(of: line),
                              language: source?.language,
                              verticalPosition: source?.verticalPosition,
                              horizontalPosition: source?.horizontalPosition)
+        }
+    }
+
+    private static func segments(of line: [(ch: Character, attr: Attr)]) -> [TextSegment] {
+        var segments: [TextSegment] = []
+        for c in line {
+            if var last = segments.last, last.style == c.attr.style, last.color == c.attr.color {
+                last.text.append(c.ch)
+                segments[segments.count - 1] = last
+            } else {
+                segments.append(TextSegment(text: String(c.ch), style: c.attr.style, color: c.attr.color))
+            }
+        }
+        return segments.isEmpty ? [TextSegment(text: "", style: [])] : segments
+    }
+
+    /// Per-line attributes for a cue whose number of lines a tool has changed.
+    private static func restacked(_ lines: [[(ch: Character, attr: Attr)]],
+                                  like template: [TextBlock],
+                                  lineSpacing: Double?) -> [TextBlock] {
+        // A language every line shared is the cue's language; one that only
+        // some lines had belongs to those lines and cannot be reassigned.
+        let languages = Set(template.map(\.language))
+        let language = languages.count == 1 ? template[0].language : nil
+
+        // Vertical. Percentages run from the bottom of the picture, and where
+        // the stack sits says which line it hangs from: a stack in the lower
+        // half grows upward from its last line (the usual case), one in the
+        // upper half grows downward from its first, and one that straddles the
+        // middle stays centred where it was.
+        let percents: [Double] = template.compactMap {
+            if case .percentage(let v) = $0.verticalPosition { return v }
+            return nil
+        }
+        var vertical = [VerticalPosition?](repeating: nil, count: lines.count)
+        if percents.count == template.count, let first = percents.first, let last = percents.last {
+            let step: Double? = percents.count >= 2
+                ? (first - last) / Double(percents.count - 1)
+                : lineSpacing
+            let high = max(first, last), low = min(first, last)
+            if lines.count == 1 {
+                vertical = [.percentage(low > 50 ? first : (high > 50 && low < 50 ? (first + last) / 2 : last))]
+            } else if let step {
+                let span = step * Double(lines.count - 1)
+                let top: Double
+                if low > 50 {
+                    top = first                              // hangs from its first line
+                } else if high > 50 && low < 50 {
+                    top = (first + last) / 2 + span / 2      // stays centred
+                } else {
+                    top = last + span                        // stands on its last line
+                }
+                vertical = lines.indices.map { .percentage(top - step * Double($0)) }
+            }
+        }
+        // Horizontal goes with the vertical: a line placed sideways but not in
+        // height would still leave the stack half-positioned.
+        let keepsPositions = vertical.contains { $0 != nil }
+            || template.allSatisfy { $0.verticalPosition == nil }
+        return lines.enumerated().map { (index, line) in
+            let source = template[min(index, template.count - 1)]
+            return TextBlock(segments: segments(of: line),
+                             language: language,
+                             verticalPosition: vertical[index],
+                             horizontalPosition: keepsPositions ? source.horizontalPosition : nil)
         }
     }
 

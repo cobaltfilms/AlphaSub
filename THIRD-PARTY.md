@@ -22,10 +22,10 @@ These run as **separate helper processes**; none is linked into AlphaSUB.
   audio extraction.
 
 ### Grok (`grk_decompress`, `grk_compress`) — AGPL-3.0
-- **Version:** v20.4.7, bundled **unmodified** (binary + dylib closure from the
+- **Version:** v20.4.15, bundled **unmodified** (binary + dylib closure from the
   Homebrew `grokj2k` bottle).
 - **Complete corresponding source:**
-  <https://github.com/GrokImageCompression/grok> (tag `v20.4.7`).
+  <https://github.com/GrokImageCompression/grok> (tag `v20.4.15`).
 - **Bundling script:** [`scripts/build-grok.sh`](scripts/build-grok.sh).
 - **License text:** bundled at `Resources/grok/LICENSE-grok.txt`;
   AGPL-3.0 text at <https://www.gnu.org/licenses/agpl-3.0.txt>.

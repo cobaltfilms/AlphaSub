@@ -424,10 +424,15 @@ public struct DCPInterOpExporter: FormatExporter {
         // `ConformanceValidator.frameRateIssue(formatID:...)` flags non-24
         // rates as an error so users know to retime or switch to DCP SMPTE.
 
-        // Declare the reel's frame rate so importers (ours and others) can
-        // recover it. Tick-based times stay rate-independent; this is metadata.
+        // <TimeCodeRate> is a SMPTE 428-7 element: the InterOp DCSubtitle
+        // schema refuses it ("This element is not expected" in ClairMeta). So
+        // a subtitle written INTO a package (the writer passes its asset id)
+        // goes without — the CPL carries the rate there. A standalone export
+        // keeps it, so the file still says its rate when re-imported; the
+        // reader honours it when present.
         let frameRate = opts.sourceFrameRate ?? track.subtitles.first?.startTime.frameRate ?? .fps24
-        let fpsInt = Int(frameRate.value.rounded())
+        let rateLine = opts.extra["dcp_resource_id"] == nil
+            ? "\n<TimeCodeRate>\(Int(frameRate.value.rounded()))</TimeCodeRate>" : ""
 
         let fontId = track.metadata["dcp_font_id"] ?? "FontID"
         let fontUri = interopFontURI(track: track, opts: opts)
@@ -496,8 +501,7 @@ public struct DCPInterOpExporter: FormatExporter {
         <MovieTitle>\(escapeXML(track.name))</MovieTitle>
         <!--DLP/Interop subtitle file-->
         <ReelNumber>\(reelNumber)</ReelNumber>
-        <Language>\(track.dcpLanguageBalise(for: .dcp_interop, bilingualUsesMul: bilingualUsesMul))</Language>
-        <TimeCodeRate>\(fpsInt)</TimeCodeRate>
+        <Language>\(track.dcpLanguageBalise(for: .dcp_interop, bilingualUsesMul: bilingualUsesMul))</Language>\(rateLine)
         <!--Supply font with file name: \(fontUri)-->
         <LoadFont Id="\(fontId)" URI="\(fontUri)"></LoadFont>
         <Font Id="\(fontId)" Color="\(fontColor)" Weight="\(fontWeight)" Size="\(fontSize)" AspectAdjust="\(fontAspect)"\(effectAttrs)>

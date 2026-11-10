@@ -66,7 +66,9 @@ public enum TimingRules {
     /// the pass did; the caller decides whether to preview or apply.
     ///
     /// Only out-points move — in-points are the subtitler's timing decisions and
-    /// are never touched — and a cue is never collapsed below one frame.
+    /// are never touched — and a cue is never collapsed below one frame. A cue
+    /// whose successor starts at or before it (two cues shown together, or an
+    /// unsorted track) is not shortened at all: it is counted as unresolved.
     ///
     /// The subtle part is what "a legal gap" means, and it has moved once. The
     /// pass used to treat a STITCHED pair — one cue's out-point sitting on the
@@ -101,7 +103,17 @@ public enum TimingRules {
             if options.fixMaxDuration { desired = min(desired, start + maxFrames) }
             // …then clamp so the gap to the next cue is LEGAL (see above).
             var nextStart: Int64? = nil
-            if options.enforceGaps, i + 1 < subs.count {
+            var cannotSeparate = false
+            if options.enforceGaps, i + 1 < subs.count,
+               subs[i + 1].startTime.totalFrames - gapF < start + 1 {
+                // The next cue starts at or before this one, or so soon after
+                // that no out-point leaves both a cue and a gap. That is two
+                // cues meant to be on screen together (dialogue below, a sign
+                // above) or a track out of order — not a gap to open. Pulling
+                // the out-point back used to cut the cue down to one frame;
+                // it is left as it is and reported instead.
+                cannotSeparate = true
+            } else if options.enforceGaps, i + 1 < subs.count {
                 let ns = subs[i + 1].startTime.totalFrames
                 nextStart = ns
                 // The floor below which the gap is wrong. With
@@ -132,6 +144,7 @@ public enum TimingRules {
             if let ns = nextStart, options.separateStitched, gapF > 0, ns - desired < gapF {
                 result.unresolvedGap += 1
             }
+            if cannotSeparate { result.unresolvedGap += 1 }
             if desired != end {
                 subs[i].endTime = Timecode(totalFrames: desired, frameRate: frameRate)
                 result.changed += 1
